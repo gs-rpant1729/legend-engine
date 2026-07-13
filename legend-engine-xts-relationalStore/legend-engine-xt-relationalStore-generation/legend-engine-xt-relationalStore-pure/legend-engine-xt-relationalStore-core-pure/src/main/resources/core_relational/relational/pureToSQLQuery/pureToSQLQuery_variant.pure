@@ -75,8 +75,8 @@ function meta::relational::functions::pureToSqlQuery::isVariantInputImpl(v: Valu
     |
       $v->match([
         fe: FunctionExpression[1] | 
-          $fe.parametersValues->head()->map(x | $x->isVariantInputImpl($vars, $state, $instanceValueLookup))->orElse(false);,
-        ve: VariableExpression[1] | 
+          $fe.parametersValues->head()->map(x | $x->isVariantInputImpl($vars, $state, $instanceValueLookup))->orElse(false),
+        ve: VariableExpression[1] |
           $state.functionReferenceScope->map(frs | $frs.resolveFunctionReferenceByName($ve.name)).select.columns->match([
             rlp: RelationalLambdaParameter[1] | 
               $rlp.type->type()->in(
@@ -148,15 +148,24 @@ function meta::relational::functions::pureToSqlQuery::isSemiStructuredArrayInput
 function meta::relational::functions::pureToSqlQuery::isSemiStructuredArrayInputForFirstAt(v: ValueSpecification[1], vars:Map<VariableExpression, ValueSpecification>[1], state: State[1]):Boolean[1]
 {
   // If disableAutoFlatten is already set, always allow (chained from isEmpty/size/fold)
-  if($state.disableAutoFlatten == true,
+  let result = if($state.disableAutoFlatten == true,
     | $v->isSemiStructuredArrayInput($vars, $state),
     | // Entry point case: check that the first param is a non-property function
       // and exclude automaps (which are compiler-generated map(collection, v_automap | v_automap.prop))
       let firstParam = $v->cast(@FunctionExpression).parametersValues->evaluateAndDeactivate()->at(0)->byPassRouterInfo();
+      // Outer call distinction: this predicate is registered for ->at(), ->first(), and ->last().
+      // For ->at() on a direct property access (e.g. `addresses->at(0)`) we skip the
+      // semi-structured path -- the regular relational at() handler is the right fit.
+      // For ->first() / ->last() on a direct property access (e.g. `addresses->first()`,
+      // `addresses->last()`) we still want to enter the semi-structured path so a
+      // variant-backed array can be picked up.
+      let isFirstOrLast = $v->cast(@FunctionExpression).func == meta::pure::functions::collection::first_T_MANY__T_$0_1$_
+                       || $v->cast(@FunctionExpression).func == meta::pure::functions::collection::last_T_MANY__T_$0_1$_;
       $firstParam->match([
         fe: FunctionExpression[1] |
-          if($fe.func->instanceOf(AbstractProperty),
-            | false,  // Direct property access like addresses->at(0) — skip
+          let firstParamFuncIsProp = $fe.func->instanceOf(AbstractProperty);
+          if($firstParamFuncIsProp && !$isFirstOrLast,
+            | false;,
             | // Check if this is an automap
               let isAutomap = $fe.functionName == 'map' && $fe->instanceValuesAtParameter(1, $vars, $state.inScopeVars)->match([
                 func: FunctionDefinition<Any>[1] |
@@ -169,11 +178,107 @@ function meta::relational::functions::pureToSqlQuery::isSemiStructuredArrayInput
                   ]);,
                 a: Any[1] | false
               ]);
-              !$isAutomap && $firstParam->isSemiStructuredArrayExpression($vars, $state);
+              let ssArrExprResult = $firstParam->isSemiStructuredArrayExpression($vars, $state);
+              !$isAutomap && $ssArrExprResult;
           );,
-        a: Any[1] | false
+        a: Any[1] | false;
       ]);
   );
+
+  $result;
+}
+
+// =========================================================================================
+// Semi-structured chain entry-PM resolution
+// =========================================================================================
+// Walks back from a property access in a Pure expression like
+//   $p.firmInfo.address.lines->first()  OR  $p.firmInfo.countries->first().someToManyProp->first()
+// to locate the *entry-point* property mapping — the property mapping that sits at the
+// boundary between the relational source (StoreMappingRouted seed) and the semi-structured chain.
+//
+// The walker threads a `candidate` property through the recursion:
+//   - each property FE overwrites `candidate` with its own $prop and descends into the receiver;
+//   - each non-property FE (first/filter/map/cast/...) RESETS `candidate` to `[]` and descends
+//     into its first parameter (Pure's ->fn pipeline desugaring). The reset enforces the
+//     invariant that the entry property must be directly connected to the source with no
+//     intervening non-property hop — otherwise it is not at the "boundary" defined above;
+//   - when the walk terminates at a StoreMappingRouted, `candidate` (if any) is by construction
+//     the property closest to the source; we resolve its PMs against `$s.sets` in place.
+//
+// Wrapper transparency: NoSetRouted, FunctionRouted and (non-mapping) ExtendedRouted subtypes
+// are all stripped without disturbing `candidate`. NoSet in particular is stripped by the
+// build/cluster pipeline for VS-shaped AST but survives inside lambdas embedded as the `func`
+// field of non-VS InstanceValue values (col(...), agg(...), KeyExpression, ...), so its own
+// arm is retained. `StoreMappingRouted` is matched *before* the generic `ExtendedRouted` arm
+// so the specialised terminal wins even though `StoreMappingRouted <: ExtendedRouted`.
+//
+// Router facts driving the design (see `store/routing.pure::routeFunctionExpressionProperty`):
+//   - a property FE with a regular relational PM is wrapped in `StoreMappingRoutedValueSpec`;
+//   - an auto-mapped property FE (SS / class-target RFPM / BindingTransformer RFPM) is wrapped
+//     in `NoSetRoutedValueSpec`, and the `shouldBeRouted=false` cascade forces every subsequent
+//     property FE in the same chain into NoSet too;
+//   - non-property FEs (first/filter/map/cast/...) are not wrapped by the property router;
+//   - the seed SMR (wrapping the class InstanceValue or a lambda VariableExpression) never has
+//     `.propertyMapping` populated by routing or by `buildStoreMappingRouted` — resolution must
+//     go through `$s.sets` and a property-name lookup.
+//
+// Whether the resolved entry PM actually indicates a semi-structured chain is decided by the
+// caller (`isSemiStructuredArrayExpression`) via a PM-type check, not by AST shape.
+function <<access.private>> meta::relational::functions::pureToSqlQuery::findSourceRelationalPropertyMapping(receiver: ValueSpecification[1], candidate: AbstractProperty<Any>[0..1]):PropertyMapping[*]
+{
+  $receiver->evaluateAndDeactivate()->match([
+    n: NoSetRoutedValueSpecification[1]        | $n.value->findSourceRelationalPropertyMapping($candidate),
+    f: FunctionRoutedValueSpecification[1]     | $f.value->findSourceRelationalPropertyMapping($candidate),
+    s: StoreMappingRoutedValueSpecification[1] |
+      // Terminal — resolve `candidate` against the seed's sets. An empty candidate means the
+      // receiver was the source itself (no upstream property access) — nothing to look up.
+      if ($candidate->isEmpty(),
+        | [],
+        | $s.sets->filter(x | $x->instanceOf(InstanceSetImplementation))->cast(@InstanceSetImplementation)
+              ->map(x | $x->propertyMappingsByPropertyName($candidate->toOne().name->toOne()));
+      );,
+    r: ExtendedRoutedValueSpecification[1]     | $r.value->findSourceRelationalPropertyMapping($candidate),
+    fe: FunctionExpression[1] |
+      $fe.func->match([
+        prop: AbstractProperty<Any>[1] |
+          // Property hop — this property becomes the new candidate. Deeper recursion decides
+          // whether it survives (bottoms out at StoreMappingRouted) or gets superseded.
+          $fe.parametersValues->evaluateAndDeactivate()->at(0)->findSourceRelationalPropertyMapping($prop);,
+        a: Any[1] |
+          // Intermediate non-property call (first/filter/map/cast/...). Step over by descending
+          // into the first parameter, RESETTING candidate — see block comment above.
+          let firstParam = $fe.parametersValues->evaluateAndDeactivate()->first();
+          if ($firstParam->isEmpty(),
+            | [],
+            | $firstParam->toOne()->findSourceRelationalPropertyMapping([]);
+          );
+      ]);,
+    a: Any[1] | []
+  ]);
+}
+
+// Entry-point overload that seeds the walk with an empty candidate. Preserves the single-arg
+// call-site signature used by `isSemiStructuredArrayExpression`.
+function <<access.private>> meta::relational::functions::pureToSqlQuery::findSourceRelationalPropertyMapping(receiver: ValueSpecification[1]):PropertyMapping[*]
+{
+  $receiver->findSourceRelationalPropertyMapping([]);
+}
+
+// Returns true iff the entry PM is one of the SS-eligible PM kinds:
+//   - SemiStructuredRelationalPropertyMapping (modern path), or
+//   - RelationFunctionPropertyMapping with a class target (Variant / user Class), or
+//   - RelationFunctionPropertyMapping with a BindingTransformer (legacy SS path).
+// Mirrors the conditions that drive NoSet emission in routing.pure
+// (`isAutoMappedRelationFunctionPropertyMapping`).
+function <<access.private>> meta::relational::functions::pureToSqlQuery::isSemiStructuredPropertyMapping(pm: PropertyMapping[1]):Boolean[1]
+{
+  $pm->match([
+    sspm: SemiStructuredRelationalPropertyMapping[1] | true,
+    rfpm: RelationFunctionPropertyMapping[1]         |
+      $rfpm.property->isClassTargetedRelationFunctionProperty()
+      || ($rfpm.transformer->isNotEmpty() && $rfpm.transformer->toOne()->instanceOf(BindingTransformer)),
+    a: PropertyMapping[1]                            | false
+  ]);
 }
 
 function <<access.private>> meta::relational::functions::pureToSqlQuery::isSemiStructuredArrayExpression(v: ValueSpecification[1], vars:Map<VariableExpression, ValueSpecification>[1], state: State[1]):Boolean[1]
@@ -182,37 +287,40 @@ function <<access.private>> meta::relational::functions::pureToSqlQuery::isSemiS
     fe: FunctionExpression[1] |
       $fe.func->match([
         prop: AbstractProperty<Any>[1] |
-          let isToMany = !$prop.multiplicity->hasToOneUpperBound();
-          let returnType = $fe.genericType.rawType;
-          let isClassType = $returnType->isNotEmpty() && $returnType->toOne()->instanceOf(Class) && $returnType->toOne() != Variant;
-          // Check if the property's owner class is accessed through a direct (non-join) semi-structured binding.
-          // Exclude join-based bindings (e.g. location: Binding ... : @Join | ...) because the disableAutoFlatten
-          // strategy does not support array operations across joins.
-          let ownerClass = $prop.owner->toOne();
-          let isSemiStructuredMapping = $isClassType && $state.mapping->isNotEmpty() &&
-            $state.mapping->toOne()->classMappings()
-              ->filter(cm | $cm->instanceOf(RelationalInstanceSetImplementation))
-              ->cast(@RelationalInstanceSetImplementation)
-              .propertyMappings
-              ->exists(pm | $pm->instanceOf(SemiStructuredRelationalPropertyMapping)
-                            && $pm.property.genericType.rawType->toOne() == $ownerClass
-                            && !$pm->cast(@SemiStructuredRelationalPropertyMapping).relationalOperationElement->instanceOf(RelationalOperationElementWithJoin));
-          $isToMany && $isClassType && $isSemiStructuredMapping;,
+          // A property access qualifies as a semi-structured array iff:
+          //   1. it is to-many (cardinality > 1),
+          //   2. walking its receiver back to the chain source yields an entry PM whose
+          //      type indicates an auto-mapped semi-structured chain (SemiStructured PM,
+          //      class-target RFPM, or BindingTransformer RFPM), and
+          //   3. that entry PM does NOT cross a JOIN (the disableAutoFlatten strategy
+          //      does not support array operations across joins,
+          //      e.g. `location: Binding ... : @Join | ...`).
+          let isToMany      = !$prop.multiplicity->hasToOneUpperBound();
+          let receiver      = $fe.parametersValues->evaluateAndDeactivate()->at(0);
+          let entryPm       = $receiver->findSourceRelationalPropertyMapping();
+          let isEntrySS     = $entryPm->exists(pm | $pm->isSemiStructuredPropertyMapping());
+          let notAcrossJoin = !$entryPm->exists(pm |
+                                  $pm->instanceOf(SemiStructuredRelationalPropertyMapping)
+                                  && $pm->cast(@SemiStructuredRelationalPropertyMapping).relationalOperationElement->instanceOf(RelationalOperationElementWithJoin)
+                               );
+          $isToMany && $isEntrySS && $notAcrossJoin;,
         a: Any[1] |
-          if ($fe.parametersValues->evaluateAndDeactivate()->isNotEmpty(),
+          let hasParams = $fe.parametersValues->evaluateAndDeactivate()->isNotEmpty();
+          if ($hasParams,
             | $fe.parametersValues->evaluateAndDeactivate()->at(0)->byPassRouterInfo()->isSemiStructuredArrayExpression($vars, $state),
             | false
           );
       ]);,
     rvs: RoutedValueSpecification[1] |
-      $rvs.value->isSemiStructuredArrayExpression($vars, $state),
-    a: Any[1] | false
+      $rvs.value->isSemiStructuredArrayExpression($vars, $state);,
+    a: Any[1] |
+      false;
   ]);
 }
 
 function <<access.private>> meta::relational::functions::pureToSqlQuery::resolveSemiStructuredBasePropertyMapping(v: ValueSpecification[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):PropertyMapping[*]
 {
-  let expr = $v->byPassRouterInfo();
+  let expr = $v;
   $expr->match([
     fe: FunctionExpression[1] |
       $fe.func->match([
@@ -235,10 +343,8 @@ function <<access.private>> meta::relational::functions::pureToSqlQuery::resolve
 function meta::relational::functions::pureToSqlQuery::processSemiStructuredArrayFirst(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
 {
   let firstParam = $f.parametersValues->evaluateAndDeactivate()->at(0);
-
   // Resolve property mapping by walking through the chain to find the base semi-structured property
   let semiStructuredPropertyMapping = $firstParam->resolveSemiStructuredBasePropertyMapping($currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
-
   // Process the input chain with disableAutoFlatten — the chain (filter, map, etc.) will be
   // dispatched to their variant handlers which produce FilterRelationalLambda/MapRelationalLambda
   let disableAutoFlattenState = ^$state(disableAutoFlatten = true);
@@ -251,14 +357,29 @@ function meta::relational::functions::pureToSqlQuery::processSemiStructuredArray
   ^OperationWithParentPropertyMapping(element = $resultOp, currentPropertyMapping = $semiStructuredPropertyMapping);
 }
 
+function meta::relational::functions::pureToSqlQuery::processSemiStructuredArrayLast(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+  let firstParam = $f.parametersValues->evaluateAndDeactivate()->at(0);
+  // Resolve property mapping by walking through the chain to find the base semi-structured property
+  let semiStructuredPropertyMapping = $firstParam->resolveSemiStructuredBasePropertyMapping($currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+  // Process the input chain with disableAutoFlatten — keeps the raw variant array intact so
+  // dialect-level array_last operates on the JSON array (not on a LATERAL-flattened scalar).
+  let disableAutoFlattenState = ^$state(disableAutoFlatten = true);
+  let inputResult = $firstParam->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$disableAutoFlattenState(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)
+    ->cast(@SelectWithCursor);
+  let inputRelOp = if($state.inFilter, |$inputResult.select.filteringOperation->toOne(), |$inputResult.select.columns->toOne());
+  let arrayLastDyna = newDynaFunction('array_last', [$inputRelOp]);
+  let select = $operation.select;
+  let resultOp = ^$operation(select = $state.inFilter->if(|^$select(filteringOperation = $arrayLastDyna), |^$select(columns = $arrayLastDyna)));
+  ^OperationWithParentPropertyMapping(element = $resultOp, currentPropertyMapping = $semiStructuredPropertyMapping);
+}
+
 function meta::relational::functions::pureToSqlQuery::processSemiStructuredArrayAt(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
 {
   let params = $f.parametersValues->evaluateAndDeactivate();
   let firstParam = $params->at(0);
-
   // Resolve property mapping by walking through the chain to find the base semi-structured property
   let semiStructuredPropertyMapping = $firstParam->resolveSemiStructuredBasePropertyMapping($currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
-
   // Process the input chain with disableAutoFlatten
   let disableAutoFlattenState = ^$state(disableAutoFlatten = true);
   let inputResult = $firstParam->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$disableAutoFlattenState(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)
@@ -278,32 +399,30 @@ function meta::relational::functions::pureToSqlQuery::processToVariant(f:Functio
   let param = $f.parametersValues->evaluateAndDeactivate()->toOne();
   let value = $param->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor);
   let toVariantValue = if($param.multiplicity->isToMany(), |$value.select.columns->toVariantFriendlyValue($param.genericType->genericTypeToDataType($param.multiplicity)), |$value.select.columns->toOne());
-
   let dynaFunc = newDynaFunction('toVariant', $toVariantValue);
-
   let select = $operation.select;
   ^$operation(select = $state.inFilter->if(|^$select(filteringOperation = $dynaFunc),|^$select(columns = $dynaFunc)));  
 }
 
 function meta::relational::functions::pureToSqlQuery::processVariantConcatenate(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
 {
-  let arr1 = $f.parametersValues->at(0)->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor).select.columns->toVariantFriendlyValue($f.genericType->genericTypeToDataType(ZeroMany));
-  let arr2 = $f.parametersValues->at(1)->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor).select.columns->toVariantFriendlyValue($f.genericType->genericTypeToDataType(ZeroMany));
-
+  // Semi-structured guard: disable auto-flatten so the array stays as a scalar column
+  let effectiveState = if($f->isSemiStructuredArrayInput($vars, $state), |^$state(disableAutoFlatten = true), |$state);
+  let arr1 = $f.parametersValues->at(0)->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$effectiveState(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor).select.columns->toVariantFriendlyValue($f.genericType->genericTypeToDataType(ZeroMany), $f, $vars, $state);
+  let arr2 = $f.parametersValues->at(1)->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$effectiveState(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor).select.columns->toVariantFriendlyValue($f.genericType->genericTypeToDataType(ZeroMany), $f, $vars, $state);
   let dynaFunc = newDynaFunction('array_concatenate', [$arr1, $arr2]);
-
   let select = $operation.select;
   ^$operation(select = $state.inFilter->if(|^$select(filteringOperation = $dynaFunc),|^$select(columns = $dynaFunc)));
 }
 
 function meta::relational::functions::pureToSqlQuery::processVariantDrop(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
 {
-  processDynaFunction('array_drop', {reo | $reo->init()->toVariantFriendlyValue($f.parametersValues->at(0).genericType->genericTypeToDataType($f.parametersValues->at(0).multiplicity))->concatenate($reo->last())}, $f, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+  processDynaFunction('array_drop', {reo | $reo->init()->toVariantFriendlyValue($f.parametersValues->at(0).genericType->genericTypeToDataType($f.parametersValues->at(0).multiplicity), $f, $vars, $state)->concatenate($reo->last())}, $f, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
 }
 
 function meta::relational::functions::pureToSqlQuery::processVariantTake(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
 {
-  processDynaFunction('array_take', {reo | $reo->init()->toVariantFriendlyValue($f.parametersValues->at(0).genericType->genericTypeToDataType($f.parametersValues->at(0).multiplicity))->concatenate($reo->last())}, $f, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+  processDynaFunction('array_take', {reo | $reo->init()->toVariantFriendlyValue($f.parametersValues->at(0).genericType->genericTypeToDataType($f.parametersValues->at(0).multiplicity), $f, $vars, $state)->concatenate($reo->last())}, $f, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
 }
 
 function meta::relational::functions::pureToSqlQuery::processVariantLast(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
@@ -328,17 +447,23 @@ function meta::relational::functions::pureToSqlQuery::processVariantTail(f:Funct
 
 function meta::relational::functions::pureToSqlQuery::processVariantPlus(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
 {
-  processDynaFunction('array_sum', {reo | $reo->toVariantFriendlyValue($f.parametersValues->at(0).genericType->genericTypeToDataType($f.parametersValues->at(0).multiplicity))}, $f, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+  // Semi-structured guard: disable auto-flatten so the array stays as a scalar column
+  let effectiveState = if($f->isSemiStructuredArrayInput($vars, $state), |^$state(disableAutoFlatten = true), |$state);
+  processDynaFunction('array_sum', {reo | $reo->toVariantFriendlyValue($f.parametersValues->at(0).genericType->genericTypeToDataType($f.parametersValues->at(0).multiplicity), $f, $vars, $state)}, $f, $currentPropertyMapping, $operation, $vars, $effectiveState, $joinType, $nodeId, $aggFromMap, $context, $extensions);
 }
 
 function meta::relational::functions::pureToSqlQuery::processVariantMax(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
 {
-  processDynaFunction('array_max', {reo | $reo->toVariantFriendlyValue($f.parametersValues->at(0).genericType->genericTypeToDataType($f.parametersValues->at(0).multiplicity))}, $f, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+  // Semi-structured guard: disable auto-flatten so the array stays as a scalar column
+  let effectiveState = if($f->isSemiStructuredArrayInput($vars, $state), |^$state(disableAutoFlatten = true), |$state);
+  processDynaFunction('array_max', {reo | $reo->toVariantFriendlyValue($f.parametersValues->at(0).genericType->genericTypeToDataType($f.parametersValues->at(0).multiplicity), $f, $vars, $state)}, $f, $currentPropertyMapping, $operation, $vars, $effectiveState, $joinType, $nodeId, $aggFromMap, $context, $extensions);
 }
 
 function meta::relational::functions::pureToSqlQuery::processVariantMin(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
 {
-  processDynaFunction('array_min', {reo | $reo->toVariantFriendlyValue($f.parametersValues->at(0).genericType->genericTypeToDataType($f.parametersValues->at(0).multiplicity))}, $f, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+  // Semi-structured guard: disable auto-flatten so the array stays as a scalar column
+  let effectiveState = if($f->isSemiStructuredArrayInput($vars, $state), |^$state(disableAutoFlatten = true), |$state);
+  processDynaFunction('array_min', {reo | $reo->toVariantFriendlyValue($f.parametersValues->at(0).genericType->genericTypeToDataType($f.parametersValues->at(0).multiplicity), $f, $vars, $state)}, $f, $currentPropertyMapping, $operation, $vars, $effectiveState, $joinType, $nodeId, $aggFromMap, $context, $extensions);
 }
 
 function meta::relational::functions::pureToSqlQuery::processVariantSort(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
@@ -355,7 +480,7 @@ function meta::relational::functions::pureToSqlQuery::processVariantSize(f:Funct
 {
   // Semi-structured guard: disable auto-flatten so the array stays as a scalar column
   let effectiveState = if($f->isSemiStructuredArrayInput($vars, $state), |^$state(disableAutoFlatten = true), |$state);
-  processDynaFunction('array_size', {reo | $reo->toVariantFriendlyValue($f.parametersValues->at(0).genericType->genericTypeToDataType($f.parametersValues->at(0).multiplicity))}, $f, $currentPropertyMapping, $operation, $vars, $effectiveState, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+  processDynaFunction('array_size', {reo | $reo->toVariantFriendlyValue($f.parametersValues->at(0).genericType->genericTypeToDataType($f.parametersValues->at(0).multiplicity), $f, $vars, $state)}, $f, $currentPropertyMapping, $operation, $vars, $effectiveState, $joinType, $nodeId, $aggFromMap, $context, $extensions);
 }
 
 function meta::relational::functions::pureToSqlQuery::processVariantAdd(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
@@ -365,16 +490,36 @@ function meta::relational::functions::pureToSqlQuery::processVariantAdd(f:Functi
 
 function meta::relational::functions::pureToSqlQuery::processVariantIsNotEmpty(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
 {
-  // Semi-structured guard: disable auto-flatten so the array stays as a scalar column
-  let effectiveState = if($f->isSemiStructuredArrayInput($vars, $state), |^$state(disableAutoFlatten = true), |$state);
-  processDynaFunction('not', $f->getVariantEmptyFunctionExpression()->evaluateAndDeactivate(), $currentPropertyMapping, $operation, $vars, $effectiveState, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+  processVariantEmpty($f, false, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
 }
 
 function meta::relational::functions::pureToSqlQuery::processVariantIsEmpty(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
 {
-  // Semi-structured guard: disable auto-flatten so the array stays as a scalar column
+  processVariantEmpty($f, true, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::processVariantEmpty(f:FunctionExpression[1], isEmpty:Boolean[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+  // Use compiler-resolved overload to decide: MANY = array (size check), 0..1 = scalar (null check)
+  let isArray = $f.func == isEmpty_Any_MANY__Boolean_1_ || $f.func == isNotEmpty_Any_MANY__Boolean_1_;
   let effectiveState = if($f->isSemiStructuredArrayInput($vars, $state), |^$state(disableAutoFlatten = true), |$state);
-  processEquals($f->getVariantEmptyFunctionExpression()->evaluateAndDeactivate(), $currentPropertyMapping, $operation, $vars, $effectiveState, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+  if($isArray,
+    | // Array input: size-based check
+      let eqResult = processEquals($f->getVariantEmptyFunctionExpression()->evaluateAndDeactivate(), $currentPropertyMapping, $operation, $vars, $effectiveState, $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor);
+      if($isEmpty,
+        | $eqResult,
+        | let sel = $eqResult.select;
+          let eqOp = $effectiveState.inFilter->if(|$sel.filteringOperation->toOne(), |$sel.columns->toOne());
+          let notOp = newDynaFunction('not', [$eqOp]);
+          ^$eqResult(select = $effectiveState.inFilter->if(|^$sel(filteringOperation = $notOp), |^$sel(columns = $notOp)));
+      );,
+    | // Scalar variant: null check
+      let processed = $f.parametersValues->at(0)->processValueSpecification($currentPropertyMapping, $operation, $vars, $effectiveState, $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor)->toOne();
+      let sel = $processed.select;
+      let col = $effectiveState.inFilter->if(|$sel.filteringOperation->toOne(), |$sel.columns->toOne());
+      let nullCheck = newDynaFunction(if($isEmpty, |'isNull', |'isNotNull'), [$col]);
+      ^$processed(select = $effectiveState.inFilter->if(|^$sel(filteringOperation = $nullCheck), |^$sel(columns = $nullCheck)));
+  );
 }
 
 function meta::relational::functions::pureToSqlQuery::getVariantEmptyFunctionExpression(f:FunctionExpression[1]):SimpleFunctionExpression[1]
@@ -394,7 +539,9 @@ function meta::relational::functions::pureToSqlQuery::getVariantEmptyFunctionExp
 
 function meta::relational::functions::pureToSqlQuery::processVariantIndexOf(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
 {
-  processDynaFunction('array_position', {reo | $reo->init()->toVariantFriendlyValue($f.parametersValues->at(0).genericType->genericTypeToDataType($f.parametersValues->at(0).multiplicity))->concatenate($reo->last())}, $f, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+  // Semi-structured guard: disable auto-flatten so the array stays as a scalar column
+  let effectiveState = if($f->isSemiStructuredArrayInput($vars, $state), |^$state(disableAutoFlatten = true), |$state);
+  processDynaFunction('array_position', {reo | $reo->init()->toVariantFriendlyValue($f.parametersValues->at(0).genericType->genericTypeToDataType($f.parametersValues->at(0).multiplicity), $f, $vars, $state)->concatenate($reo->last())}, $f, $currentPropertyMapping, $operation, $vars, $effectiveState, $joinType, $nodeId, $aggFromMap, $context, $extensions);
 }
 
 function meta::relational::functions::pureToSqlQuery::processVariant_notSupportedYet(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
@@ -405,17 +552,19 @@ function meta::relational::functions::pureToSqlQuery::processVariant_notSupporte
 
 function meta::relational::functions::pureToSqlQuery::processVariantSlice(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
 {
-  processDynaFunction('array_slice', {reo | $reo->take($reo->size() - 2)->toVariantFriendlyValue($f.parametersValues->at(0).genericType->genericTypeToDataType($f.parametersValues->at(0).multiplicity))->concatenate($reo->drop($reo->size() - 2))}, $f, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+  processDynaFunction('array_slice', {reo | $reo->take($reo->size() - 2)->toVariantFriendlyValue($f.parametersValues->at(0).genericType->genericTypeToDataType($f.parametersValues->at(0).multiplicity), $f, $vars, $state)->concatenate($reo->drop($reo->size() - 2))}, $f, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
 }
 
 function meta::relational::functions::pureToSqlQuery::processVariantContains(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
 {
-  processDynaFunction('array_contains', {reo | $reo->init()->toVariantFriendlyValue($f.parametersValues->at(0).genericType->genericTypeToDataType($f.parametersValues->at(0).multiplicity))->concatenate($reo->last())}, $f, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+  // Semi-structured guard: disable auto-flatten so the array stays as a scalar column
+  let effectiveState = if($f->isSemiStructuredArrayInput($vars, $state), |^$state(disableAutoFlatten = true), |$state);
+  processDynaFunction('array_contains', {reo | $reo->init()->toVariantFriendlyValue($f.parametersValues->at(0).genericType->genericTypeToDataType($f.parametersValues->at(0).multiplicity), $f, $vars, $state)->concatenate($reo->last())}, $f, $currentPropertyMapping, $operation, $vars, $effectiveState, $joinType, $nodeId, $aggFromMap, $context, $extensions);
 }
 
 function meta::relational::functions::pureToSqlQuery::processVariantRemoveDuplicates(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
 {
-  processDynaFunction('array_distinct', {reo | $reo->toVariantFriendlyValue($f.parametersValues->at(0).genericType->genericTypeToDataType($f.parametersValues->at(0).multiplicity))}, $f, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+  processDynaFunction('array_distinct', {reo | $reo->toVariantFriendlyValue($f.parametersValues->at(0).genericType->genericTypeToDataType($f.parametersValues->at(0).multiplicity), $f, $vars, $state)}, $f, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
 }
 
 function meta::relational::functions::pureToSqlQuery::findVariantType(value: RelationalOperationElement[1]):meta::relational::metamodel::datatype::TypedSemiStructured[0..1]
@@ -446,17 +595,16 @@ function meta::relational::functions::pureToSqlQuery::findVariantType(value: Rel
 
 function meta::relational::functions::pureToSqlQuery::processVariantInstanceOf(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
 {
-  let variant = $f.parametersValues->at(0)->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor).select.columns->toOne();
+  // Semi-structured guard: disable auto-flatten so the array stays as a scalar column
+  let effectiveState = if($f->isSemiStructuredArrayInput($vars, $state), |^$state(disableAutoFlatten = true), |$state);
+  let variant = $f.parametersValues->at(0)->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$effectiveState(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor).select.columns->toOne();
   let class = $f->instanceValueAtParameter(1)->toOne()->cast(@Class<Any>);
-
   let variantToMetadata = findVariantType($variant);
   let keyProp = $variantToMetadata.typeName->orElse('_type');
   let className = $variantToMetadata.typeLookup->filter(p | $p.second == $class)->head().first->orElse($class.name->toOne());
-
   let typeProp = ^SemiStructuredPropertyAccess(operand = $variant, property = ^Literal(value = $keyProp), returnType = String);
   let typePropCasted = newDynaFunction('variantTo', [$typeProp, ^DataTypeInfo(dataType = ^meta::relational::metamodel::datatype::Varchar(size=100))]);
   let instanceOf = newDynaFunction('equal', [$typePropCasted, ^Literal(value = $className)]);
-
   let select = $operation.select;
   ^$operation(select = $state.inFilter->if(|^$select(filteringOperation = $instanceOf),|^$select(columns = $instanceOf)));  
 }
@@ -465,10 +613,8 @@ function meta::relational::functions::pureToSqlQuery::processList(f:FunctionExpr
 {
   let results = $f.parametersValues->map(valueParam | $valueParam->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor));
   let columns = $results.select.columns;
-
   let paramType = $f.parametersValues->at(0).genericType->genericTypeToDataType($f.parametersValues->at(0).multiplicity);
   let dynaFunc = $results.select.columns->toVariantFriendlyValue($paramType);
-
   let select = $operation.select;
   ^$operation(select = $state.inFilter->if(|^$select(filteringOperation = $dynaFunc),|^$select(columns = $dynaFunc)));
 }
@@ -478,10 +624,8 @@ function meta::relational::functions::pureToSqlQuery::processNewMap(f:FunctionEx
   let results = $f.parametersValues->map(valueParam | $valueParam->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor));
   let columns = $results.select.columns->filter(x | !$x->instanceOf(Literal) || !$x->cast(@Literal).value->instanceOf(SQLNull))->cast(@DynaFunction);
   $columns->forAll(x | assertEquals('pair', $x.name));
-
   let variantObj = newDynaFunction('toVariantObject', $columns.parameters);
   let dynaFunc = newDynaFunction('cast', [$variantObj, ^DataTypeInfo(dataType = $f.genericType->genericTypeToDataType($f.multiplicity))]);
-
   let select = $operation.select;
   ^$operation(select = $state.inFilter->if(|^$select(filteringOperation = $dynaFunc),|^$select(columns = $dynaFunc)));
 }
@@ -489,14 +633,11 @@ function meta::relational::functions::pureToSqlQuery::processNewMap(f:FunctionEx
 function meta::relational::functions::pureToSqlQuery::processPutAllPairs(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
 {
   let map = $f.parametersValues->at(0)->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor).select.columns;
-
   let pairs = $f.parametersValues->at(1)->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor).select.columns->filter(x | !$x->instanceOf(Literal) || !$x->cast(@Literal).value->instanceOf(SQLNull))->cast(@DynaFunction);
   $pairs->forAll(x | assertEquals('pair', $x.name));
   let pairsAsMap = newDynaFunction('toVariantObject', $pairs.parameters);
   let mapCasted = newDynaFunction('cast', [$pairsAsMap, ^DataTypeInfo(dataType = $f.parametersValues->at(1).genericType->genericTypeToDataType(ZeroOne))]);
-
   let dynaFunc = newDynaFunction('mapConcatenate', $map->concatenate($mapCasted));
-
   let select = $operation.select;
   ^$operation(select = $state.inFilter->if(|^$select(filteringOperation = $dynaFunc),|^$select(columns = $dynaFunc)));
 }
@@ -518,12 +659,9 @@ function meta::relational::functions::pureToSqlQuery::processPut(f:FunctionExpre
   let map = $f.parametersValues->at(0)->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor).select.columns;
   let key = $f.parametersValues->at(1)->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor).select.columns;
   let value = $f.parametersValues->at(2)->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor).select.columns;
-
   let keyValue = newDynaFunction('toVariantObject', $key->concatenate($value));
   let mapCasted = newDynaFunction('cast', [$keyValue, ^DataTypeInfo(dataType = $f.parametersValues->at(0).genericType->genericTypeToDataType($f.parametersValues->at(0).multiplicity))]);
-
   let dynaFunc = newDynaFunction('mapConcatenate', $map->concatenate($mapCasted));
-
   let select = $operation.select;
   ^$operation(select = $state.inFilter->if(|^$select(filteringOperation = $dynaFunc),|^$select(columns = $dynaFunc)));
 }
@@ -535,22 +673,17 @@ function meta::relational::functions::pureToSqlQuery::processVariantAt(f:Functio
   let arraySource = $params->at(0)->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)
     ->cast(@SelectWithCursor);
   let operand = $arraySource.select.columns->toOne();
-
   let propertyToAccess = $params->at(1)->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)
     ->cast(@SelectWithCursor);
   let property = $propertyToAccess.select.columns->toOne();
-
   let rawRelOpElement = ^SemiStructuredArrayElementAccess(index = $property, operand = $operand, returnType = $f.genericType.rawType);
-
   let dataType = $f.genericType->genericTypeToDataType(ZeroOne);
-
   // dont cast if going from variant to variant
   let relOpElement = $dataType->match([
     s: meta::relational::metamodel::datatype::SemiStructured[1] | $rawRelOpElement,
     o: meta::relational::metamodel::datatype::Object[1] | $rawRelOpElement,
     any: Any[1] | newDynaFunction('cast', [$rawRelOpElement, ^DataTypeInfo(dataType = $dataType)])
   ]);
-
 
   let select = $operation.select;
   ^$operation(select = $state.inFilter->if(|^$select(filteringOperation = $relOpElement),|^$select(columns = $relOpElement)));
@@ -563,22 +696,17 @@ function meta::relational::functions::pureToSqlQuery::processMapGet(f:FunctionEx
   let mapSource = $params->at(0)->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)
     ->cast(@SelectWithCursor);
   let operand = $mapSource.select.columns->toOne();
-
   let propertyToAccess = $params->at(1)->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)
     ->cast(@SelectWithCursor);
   let property = $propertyToAccess.select.columns->toOne();
-
   let rawRelOpElement = ^SemiStructuredPropertyAccess(property = $property, operand = $operand->unwrapAlias(), returnType = $f.genericType.rawType);
-
   let dataType = $f.genericType->genericTypeToDataType(ZeroOne);
-
   // dont cast if going from variant to variant
   let relOpElement = $dataType->match([
     s: meta::relational::metamodel::datatype::SemiStructured[1] | $rawRelOpElement,
     o: meta::relational::metamodel::datatype::Object[1] | $rawRelOpElement,
     any: Any[1] | newDynaFunction('cast', [$rawRelOpElement, ^DataTypeInfo(dataType = $dataType)])
   ]);
-
   let select = $operation.select;
   ^$operation(select = $state.inFilter->if(|^$select(filteringOperation = $relOpElement),|^$select(columns = $relOpElement)));  
 }
@@ -586,31 +714,23 @@ function meta::relational::functions::pureToSqlQuery::processMapGet(f:FunctionEx
 function meta::relational::functions::pureToSqlQuery::processVariantFold(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
 {
   let params = $f.parametersValues->evaluateAndDeactivate();
-
   let foldFunctionType = $params->at(1).genericType.typeArguments.rawType->toOne()->cast(@FunctionType);
-
   let foldFunctionParamNames = $foldFunctionType.parameters->evaluateAndDeactivate().name;
   let foldFunctionParamTypes = $foldFunctionType.parameters->evaluateAndDeactivate().genericType;
-
   // Semi-structured guard: disable auto-flatten so the array stays as a scalar column
   let effectiveState = if($f->isSemiStructuredArrayInput($vars, $state), |^$state(disableAutoFlatten = true), |$state);
-
   let valueToFoldProcessed = $params->at(0)->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$effectiveState(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)
     ->cast(@SelectWithCursor);
     
   let param1Type = $foldFunctionParamTypes->at(0)->genericTypeToDataType($foldFunctionType.parameters->at(0).multiplicity);
-  let valueToFold = $valueToFoldProcessed.select.columns->toVariantFriendlyValue($param1Type);
+  let valueToFold = $valueToFoldProcessed.select.columns->toVariantFriendlyValue($param1Type, $f, $vars, $state);
   let param1 = ^RelationalLambdaParameter(name = $foldFunctionParamNames->at(0), value = $valueToFold, type = $param1Type);
-
   let foldStartingValueProcessed = $params->at(2)->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)
     ->cast(@SelectWithCursor);
-
   let param2Type = $f.genericType->genericTypeToDataType($f.multiplicity);
   
   let foldStartingValue = if($f.multiplicity->isToMany(), |$foldStartingValueProcessed.select.columns->toVariantFriendlyValue($param2Type), |$foldStartingValueProcessed.select.columns->toOne());
-
   let param2 = ^RelationalLambdaParameter(name = $foldFunctionParamNames->at(1), value = $foldStartingValue, type = $param2Type);
-
   let select = $operation.select;
   let updatedState = $state->updateFunctionParamsScope($foldFunctionType,
       [
@@ -618,61 +738,53 @@ function meta::relational::functions::pureToSqlQuery::processVariantFold(f:Funct
         ^$operation(select = ^$select(columns = $param2))
       ]
     );    
-
   let lambdaBodyProcessed = $params->at(1)->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$updatedState(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)
     ->cast(@SelectWithCursor);
   let lambdaBody = $lambdaBodyProcessed.select.columns->toOne();
-
   let relOpElement = ^FoldRelationalLambda(parameters = [$param1, $param2], body = $lambdaBody);
-
   ^$operation(select = $state.inFilter->if(|^$select(filteringOperation = $relOpElement),|^$select(columns = $relOpElement)));    
 }
 
 function meta::relational::functions::pureToSqlQuery::processVariantMap(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
 {
   let params = $f.parametersValues->evaluateAndDeactivate();
-
   let mapFunctionType = $params->at(1).genericType.typeArguments.rawType->toOne()->cast(@FunctionType);
-
   let mapFunctionParamNames = $mapFunctionType.parameters->evaluateAndDeactivate().name;
   let mapFunctionParamTypes = $mapFunctionType.parameters->evaluateAndDeactivate().genericType;
-
   let valueToMapProcessed = $params->at(0)->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)
     ->cast(@SelectWithCursor);
-
   let valueToMapType = $mapFunctionParamTypes->at(0)->genericTypeToDataType($mapFunctionType.parameters->at(0).multiplicity);
   let valueToMap = $valueToMapProcessed.select.columns->toVariantFriendlyValue($valueToMapType);
-
   let param = ^RelationalLambdaParameter(name = $mapFunctionParamNames->at(0), value = $valueToMap, type = $valueToMapType);
-
   let select = $operation.select;
   let updatedState = $state->updateFunctionParamsScope($mapFunctionType,
       [
         ^$operation(select = ^$select(columns = $param))
       ]
     );      
-
   let lambdaBodyProcessed = $params->at(1)->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$updatedState(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor);
-
   let lambdaBody = $lambdaBodyProcessed.select.columns->toOne();
-
-  let relOpElement = ^MapRelationalLambda(parameters = $param, body = $lambdaBody);
-
-  ^$operation(select = $state.inFilter->if(|^$select(filteringOperation = $relOpElement),|^$select(columns = $relOpElement)));    
+  // When the lambda body produces a [*] result, wrap the MapRelationalLambda in
+  // array_flatten so the outer shape stays flat (parallel to processVariantPropertyNavigation
+  // lines 5118 / 5169). Without this, arr->map(f | $f.[*]Property) produces Array<Array<X>>
+  // and the LATERAL gate only explodes the outer dimension, leaving an array per row.
+  let bodyMult     = $mapFunctionType.returnMultiplicity;
+  let mapLambda    = ^MapRelationalLambda(parameters = $param, body = $lambdaBody);
+  let relOpElement = if($bodyMult->isToMany(),
+                        | newDynaFunction('array_flatten', $mapLambda),
+                        | $mapLambda);
+  ^$operation(select = $state.inFilter->if(|^$select(filteringOperation = $relOpElement),|^$select(columns = $relOpElement)));
 }
 
 function meta::relational::functions::pureToSqlQuery::processVariantPropertyNavigation(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
 {
   let params = $f.parametersValues->evaluateAndDeactivate();
-
   let operand = $params->at(0)->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor);
-
   let inputMult = $params->at(0)->byPassRouterInfo()->match([
     e: Expression[1] | $e.multiplicity,
     i: InstanceValue[1] | $i.multiplicity
   ]);
-
-  let func = if ($f.func->instanceOf(AbstractProperty), 
+  let func = if ($f.func->instanceOf(AbstractProperty),
     |
       $f.func;
     ,
@@ -680,16 +792,13 @@ function meta::relational::functions::pureToSqlQuery::processVariantPropertyNavi
       let funcDef = $f->instanceValueAtParameter(1)->cast(@FunctionDefinition<Any>);
       $funcDef.expressionSequence->at(0)->byPassRouterInfo()->cast(@FunctionExpression).func;
   )->cast(@AbstractProperty<Any>);
-  
   let propMult = $func->functionReturnMultiplicity();
   let dataType = $f.genericType->genericTypeToDataType($propMult);
-
   let result = $func->match([
     prop: Property<Nil, Any|*>[1] | 
       
       print(if(!$context.debug, |'',
         | $context.space+'   Processing variant property navigation: ' + $prop->printProperty() + '  \n'));
-
       if ($inputMult->isToMany(),
         |
           let param = ^RelationalLambdaParameter(name = 'v_automap', value = $operand.select.columns->toOne(), type = ^meta::relational::metamodel::datatype::SemiStructured());
@@ -701,9 +810,7 @@ function meta::relational::functions::pureToSqlQuery::processVariantPropertyNavi
             o: meta::relational::metamodel::datatype::Object[1] | $relOpElement,
             any: Any[1] | newDynaFunction('variantTo', [$relOpElement, ^DataTypeInfo(dataType = $dataType)])
           ]);
-
           let autoMapOp = ^MapRelationalLambda(parameters = $param, body = $value);
-
           if ($propMult->isToMany(),
             |
               newDynaFunction('array_flatten', $autoMapOp)        
@@ -714,7 +821,6 @@ function meta::relational::functions::pureToSqlQuery::processVariantPropertyNavi
         ,
         |
           let relOpElement = ^SemiStructuredPropertyAccess(property = ^Literal(value = $prop.name->toOne()), operand = $operand.select.columns->unwrapAlias()->toOne());
-
           // dont cast if going from variant to variant
           $dataType->match([
             s: meta::relational::metamodel::datatype::SemiStructured[1] | $relOpElement,
@@ -724,37 +830,27 @@ function meta::relational::functions::pureToSqlQuery::processVariantPropertyNavi
       );
     ,
     qprop: QualifiedProperty<Any>[1] |
-
       let ft =  $qprop->genericType().typeArguments.rawType->cast(@FunctionType)->toOne();
-
       let qtParams = $ft.parameters;
-
       print(if(!$context.debug, |'',
         | $context.space+'   Processing variant qualified property navigation: ' + $qprop->printProperty($params, [], ^GContext(space = '')) + '  \n'));  
-
       let thisVar = $qtParams->toOne($qprop.name->toOne() + ': Qualified properties with paramteters are not supported yet!');
       
       let expression = $qprop.expressionSequence->toOne($qprop.name->toOne() + ': Qualified properties with more than one line/expression are not supported!')->cast(@ValueSpecification);
-
       let paramValue = if ($inputMult->isToMany(), 
         | 
           $operand.select.columns->toOne(),
         | 
           newDynaFunction('toVariantList', $operand.select.columns->toOne())
       );
-
       let param = ^RelationalLambdaParameter(name = $thisVar.name->toOne(), value = $paramValue, type = ^meta::relational::metamodel::datatype::SemiStructured());
       
       let select = $operation.select;
             
       let updatedState = $state->updateFunctionParamScope($ft, ^$operation(select = ^$select(columns = $param)));            
-
       let lambdaBodyProcessed = $expression->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$updatedState(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor);
-
       let value = $lambdaBodyProcessed.select.columns->toOne();
-
       let autoMapOp = ^MapRelationalLambda(parameters = $param, body = $value);
-
       if ($propMult->isToMany(),
         |
           newDynaFunction('array_flatten', $autoMapOp)        
@@ -774,117 +870,153 @@ function meta::relational::functions::pureToSqlQuery::processVariantPropertyNavi
       );
   ]);
 
-
   let select = $operation.select;
   ^$operation(select = $state.inFilter->if(|^$select(filteringOperation = $result),|^$select(columns = $result)));    
+}
+
+// Variant-aware `exists` handler. Rewrites `arr->exists(p)` as `arr->filter(p)->isNotEmpty()`
+// and delegates to processVariantIsNotEmpty, which itself composes processVariantSize +
+// processVariantFilter via the standard variant dispatch. The end result is a scalar
+// column expression (NOT(array_size(array_filter(arr, p)) = 0)) — no row-producing
+// lateral flatten — so cardinality of the outer query is preserved. Only invoked when a
+// variant predicate fires on the exists expression; non-variant `exists` falls through to
+// the generic processExists entry in the flat registry.
+function meta::relational::functions::pureToSqlQuery::processVariantExists(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+  let arrParam       = $f.parametersValues->at(0);
+  let predicateParam = $f.parametersValues->at(1);
+  // Synthesise filter(arr, p) — bare-FE wrapping (no enclosing InstanceValue), so the
+  // head-spine traversal inside the variant predicates still reaches the original
+  // Variant-typed leaf when processVariantSize re-dispatches the inner filterFE.
+  let filterFE = ^SimpleFunctionExpression(
+    func             = filter_T_MANY__Function_1__T_MANY_,
+    functionName     = 'filter',
+    importGroup      = system::imports::coreImport,
+    genericType      = $arrParam.genericType,
+    multiplicity     = ZeroMany,
+    parametersValues = [$arrParam, $predicateParam]
+  )->evaluateAndDeactivate();
+  // Synthesise isNotEmpty(filterFE) — again bare-FE wrapping. processVariantEmpty will
+  // build a size FE via ^$f(func=size_..., ...) that inherits these parametersValues,
+  // so the recursive dispatch through processVariantSize → processVariantFilter is intact.
+  let isNotEmptyFE = ^SimpleFunctionExpression(
+    func             = isNotEmpty_Any_MANY__Boolean_1_,
+    functionName     = 'isNotEmpty',
+    importGroup      = system::imports::coreImport,
+    genericType      = ^GenericType(rawType=Boolean),
+    multiplicity     = PureOne,
+    parametersValues = [$filterFE]
+  )->evaluateAndDeactivate();
+  processVariantIsNotEmpty($isNotEmptyFE, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
 }
 
 function meta::relational::functions::pureToSqlQuery::processVariantFilter(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
 {
   let params = $f.parametersValues->evaluateAndDeactivate();
-
   let filterFunctionType = $params->at(1).genericType.typeArguments.rawType->toOne()->cast(@FunctionType);
-
   let filterFunctionParamNames = $filterFunctionType.parameters->evaluateAndDeactivate().name;
   let filterFunctionParamTypes = $filterFunctionType.parameters->evaluateAndDeactivate().genericType;
-
   let valueToFilterProcessed = $params->at(0)->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)
     ->cast(@SelectWithCursor);
-
   let valueToFilterType = $filterFunctionParamTypes->at(0)->genericTypeToDataType($filterFunctionType.parameters->at(0).multiplicity);
   let valueToFilter = $valueToFilterProcessed.select.columns->toVariantFriendlyValue($valueToFilterType);
-
   let param = ^RelationalLambdaParameter(name = $filterFunctionParamNames->at(0), value = $valueToFilter, type = $valueToFilterType);
-
   let select = $operation.select;
   let updatedState = $state->updateFunctionParamsScope($filterFunctionType,
       [
         ^$operation(select = ^$select(columns = $param))
       ]
     );
-
   let lambdaBodyProcessed = $params->at(1)->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$updatedState(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)
     ->cast(@SelectWithCursor);
   let lambdaBody = $lambdaBodyProcessed.select.columns->toOne();
-
   let relOp = ^FilterRelationalLambda(parameters = $param, body = $lambdaBody);
-
   ^$operation(select = $state.inFilter->if(|^$select(filteringOperation = $relOp),|^$select(columns = $relOp)));  
 }
 
 function meta::relational::functions::pureToSqlQuery::toVariantFriendlyValue(cols: RelationalOperationElement[*], dataType: meta::relational::metamodel::datatype::DataType[0..1]):RelationalOperationElement[1]
 {
+  // Back-compat overload: callers that are not in a variant-array context (or that cannot
+  // reach a FunctionExpression / vars / state -- e.g. fold seed, list builder, processToVariant)
+  // never need the variant->array cast wrap.
+  toVariantFriendlyValueImpl($cols, $dataType, false);
+}
+
+function meta::relational::functions::pureToSqlQuery::toVariantFriendlyValue(cols: RelationalOperationElement[*], dataType: meta::relational::metamodel::datatype::DataType[0..1], f: FunctionExpression[1], vars: Map<VariableExpression, ValueSpecification>[1], state: State[1]):RelationalOperationElement[1]
+{
+  // Variant-aware overload: pushes the `isSemiStructuredArrayInput` check inside so callers
+  // do not need to hoist it. When the receiver of $f is a semi-structured array (e.g.
+  // $person.firmInfo.countries), wrap the single non-literal column in a cast to
+  // Array<dataType>. Snowflake renders this as `cast(<x> as ARRAY(<T>))` which coerces a
+  // VARIANT containing a JSON array into a true ARRAY (needed for strict array operators
+  // such as ARRAY_POSITION / ARRAY_CONTAINS).
+  toVariantFriendlyValueImpl($cols, $dataType, $f->isSemiStructuredArrayInput($vars, $state));
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::toVariantFriendlyValueImpl(cols: RelationalOperationElement[*], dataType: meta::relational::metamodel::datatype::DataType[0..1], wrapAsArray: Boolean[1]):RelationalOperationElement[1]
+{
+  let arrayType = if ($dataType->isNotEmpty() && $dataType->toOne()->instanceOf(meta::relational::metamodel::datatype::Array), |$dataType->toOne(), |^meta::relational::metamodel::datatype::Array(type = $dataType));
   let toList = {toList: RelationalOperationElement[*] |
-    let arrayType = if ($dataType->isNotEmpty() && $dataType->toOne()->instanceOf(meta::relational::metamodel::datatype::Array), |$dataType->toOne(), |^meta::relational::metamodel::datatype::Array(type = $dataType));
     newDynaFunction('cast', newDynaFunction('toVariantList', $toList)->concatenate(^DataTypeInfo(dataType = $arrayType)));
   };
-
   $cols->unwrapAlias()->match([
     l: Literal[1] | $toList->eval($l->filter(v | !$v.value->instanceOf(SQLNull))),
-    c: RelationalOperationElement[1] | $c,
+    c: RelationalOperationElement[1] | if($wrapAsArray, |newDynaFunction('cast', $c->concatenate(^DataTypeInfo(dataType = $arrayType))), |$c),
     a: RelationalOperationElement[*] | $toList->eval($a)
   ]);
 }
 
 function meta::relational::functions::pureToSqlQuery::processVariantFlatten(expression:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
 {
-   assert(!$state.inFilter, |'Flatten not supported on inside filter');
-
-   let isLateralFlatten = $state.functionExpressionStack->init()->last()->evaluateAndDeactivate().func == meta::pure::functions::relation::lateral_Relation_1__Function_1__Relation_1_;
-
-   let columnName = $expression->instanceValuesAtParameter(1, $vars, $state.inScopeVars)->toOne()->cast(@meta::pure::metamodel::relation::ColSpec<Any>).name;
-
-   let flattenNavigation = processValueSpecification($expression.parametersValues->at(0), $currentPropertyMapping, $operation, $vars, $state, $joinType, buildNodeId($nodeId,'_d0'), $aggFromMap, $context, $extensions)->cast(@SelectWithCursor);                        
-   let flattenNavigationSelect = $flattenNavigation.select->mergeSQLQueryData($nodeId, $state, $context, $extensions);
-   
-   let paramType = $expression.parametersValues->at(0).genericType->genericTypeToDataType($expression.parametersValues->at(0).multiplicity);
-
-   let navigation =$flattenNavigationSelect.columns->toVariantFriendlyValue($paramType);
-   
-   let column = ^Column(name = 'VALUE', type = ^meta::relational::metamodel::datatype::SemiStructured());
-   let flattenOperation = if($isLateralFlatten, |^SemiStructuredArrayFlatten(navigation = $navigation), |^SemiStructuredArrayFlattenRelation(navigation = $navigation));
-
-   let flattenTableAlias = ^TableAlias(relationalElement = $flattenOperation, name = 'flatten_' + $nodeId);
-
-   let flattenedColumn = ^TableAliasColumn(alias = $flattenTableAlias, column = $column);
-   let flattenedParamType = $expression.parametersValues->at(0).genericType->genericTypeToDataType(ZeroOne);
-   let flattenOutput = ^Alias(name = $columnName->addQuotesIfNecessary(), relationalElement = newDynaFunction('cast', [$flattenedColumn, ^DataTypeInfo(dataType = $flattenedParamType)]));
-
-   let node = ^RootJoinTreeNode(alias = $flattenTableAlias, columns = $flattenOutput);
-
-   let resSelect = ^TdsSelectSqlQuery(data = $node, columns = $flattenOutput);
-   
-   $resSelect->validate($extensions);
-   
-   ^$operation(select = $resSelect);
+  assert(!$state.inFilter, |'Flatten not supported on inside filter');
+  let isLateralFlatten = $state.functionExpressionStack->init()->last()->evaluateAndDeactivate().func == meta::pure::functions::relation::lateral_Relation_1__Function_1__Relation_1_;
+  let columnName = $expression->instanceValuesAtParameter(1, $vars, $state.inScopeVars)->toOne()->cast(@meta::pure::metamodel::relation::ColSpec<Any>).name;
+  let flattenNavigation = processValueSpecification($expression.parametersValues->at(0), $currentPropertyMapping, $operation, $vars, $state, $joinType, buildNodeId($nodeId,'_d0'), $aggFromMap, $context, $extensions)->cast(@SelectWithCursor);                        
+  let flattenNavigationSelect = $flattenNavigation.select->mergeSQLQueryData($nodeId, $state, $context, $extensions);
+  
+  let paramType = $expression.parametersValues->at(0).genericType->genericTypeToDataType($expression.parametersValues->at(0).multiplicity);
+  let navigation =$flattenNavigationSelect.columns->toVariantFriendlyValue($paramType);
+  
+  let column = ^Column(name = 'VALUE', type = ^meta::relational::metamodel::datatype::SemiStructured());
+  let flattenOperation = if($isLateralFlatten, |^SemiStructuredArrayFlatten(navigation = $navigation), |^SemiStructuredArrayFlattenRelation(navigation = $navigation));
+  let flattenTableAlias = ^TableAlias(relationalElement = $flattenOperation, name = 'flatten_' + $nodeId);
+  let flattenedColumn = ^TableAliasColumn(alias = $flattenTableAlias, column = $column);
+  let flattenedParamType = $expression.parametersValues->at(0).genericType->genericTypeToDataType(ZeroOne);
+  let flattenOutput = ^Alias(name = $columnName->addQuotesIfNecessary(), relationalElement = newDynaFunction('cast', [$flattenedColumn, ^DataTypeInfo(dataType = $flattenedParamType)]));
+  let node = ^RootJoinTreeNode(alias = $flattenTableAlias, columns = $flattenOutput);
+  let resSelect = ^TdsSelectSqlQuery(data = $node, columns = $flattenOutput);
+  
+  $resSelect->validate($extensions);
+  
+  ^$operation(select = $resSelect);
 }
 
 function meta::relational::functions::pureToSqlQuery::processVariantJoinStrings(expression:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
 {
-   let params = $expression.parametersValues->evaluateAndDeactivate();
-   let size = $params->size();
-   let firstParam = $params->at(0);
-   let semiStructuredPropertyMapping = $firstParam->resolveSemiStructuredBasePropertyMapping($currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+  let params = $expression.parametersValues->evaluateAndDeactivate();
+  let size = $params->size();
+  let firstParam = $params->at(0);
+  let semiStructuredPropertyMapping = $firstParam->resolveSemiStructuredBasePropertyMapping($currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
 
-   let inputResult = $firstParam->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(disableAutoFlatten = true, inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor);
-   let value = if($state.inFilter, |$inputResult.select.filteringOperation, |$inputResult.select.columns);
-   let inputRelOp = $value->toVariantFriendlyValue($firstParam.genericType->genericTypeToDataType($firstParam.multiplicity));
+  let inputResult = $firstParam->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(disableAutoFlatten = true, inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor);
+  let value = if($state.inFilter, |$inputResult.select.filteringOperation, |$inputResult.select.columns);
+  let inputRelOp = $value->toVariantFriendlyValue($firstParam.genericType->genericTypeToDataType($firstParam.multiplicity));
 
-   let separator = if(eq($size, 1),
-                      | ^Literal(value=''),
-                      | $params->at(if(eq($size, 2), |1, |2))->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor).select.columns->toOne()
+  let separator = if(eq($size, 1),
+                    | ^Literal(value=''),
+                    | $params->at(if(eq($size, 2), |1, |2))->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor).select.columns->toOne()
+                );
+  let arrayToStringDyna = newDynaFunction('array_to_string', [$inputRelOp, $separator]);
+  let resultDyna = if(eq($size, 4),
+                      | let prefix = $params->at(1)->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor).select.columns->toOne();
+                        let suffix = $params->at(3)->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor).select.columns->toOne();
+                        newDynaFunction('concat', [$prefix, $arrayToStringDyna, $suffix]);,
+                      | $arrayToStringDyna
                   );
-   let arrayToStringDyna = newDynaFunction('array_to_string', [$inputRelOp, $separator]);
-   let resultDyna = if(eq($size, 4),
-                       | let prefix = $params->at(1)->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor).select.columns->toOne();
-                         let suffix = $params->at(3)->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor).select.columns->toOne();
-                         newDynaFunction('concat', [$prefix, $arrayToStringDyna, $suffix]);,
-                       | $arrayToStringDyna
-                   );
 
-   let select = $operation.select;
-   let resultOp = ^$operation(select = $state.inFilter->if(|^$select(filteringOperation = $resultDyna), |^$select(columns = $resultDyna)));
-   ^OperationWithParentPropertyMapping(element = $resultOp, currentPropertyMapping = $semiStructuredPropertyMapping);
+  let select = $operation.select;
+  let resultOp = ^$operation(select = $state.inFilter->if(|^$select(filteringOperation = $resultDyna), |^$select(columns = $resultDyna)));
+  ^OperationWithParentPropertyMapping(element = $resultOp, currentPropertyMapping = $semiStructuredPropertyMapping);
 }
 
 // Resolves placeholder TACs inside a SemiStructuredPropertyAccess by recursing into operand.
@@ -1010,15 +1142,15 @@ function meta::relational::functions::pureToSqlQuery::explodeInCurrentJoinOperat
 function meta::relational::functions::pureToSqlQuery::extractExplodeSemiStructured(op: RelationalOperationElement[1]):RelationalOperationElement[*]
 {
   $op->match([
-      d:DynaFunction[1] | if($d.name == meta::relational::functions::sqlQueryToString::DynaFunctionRegistry.explodeSemiStructured.name, | $d, | [])->concatenate($d.parameters->map(p|$p->extractExplodeSemiStructured())),
-      a:Any[1]| []
-    ]);
+    d:DynaFunction[1] | if($d.name == meta::relational::functions::sqlQueryToString::DynaFunctionRegistry.explodeSemiStructured.name, | $d, | [])->concatenate($d.parameters->map(p|$p->extractExplodeSemiStructured())),
+    a:Any[1]| []
+  ]);
 }
 
 function meta::relational::functions::pureToSqlQuery::explodeReturnType(typeName:String[1]):Type[0..1]
 {
-    let map = meta::relational::functions::database::sqlTextToRelationalDataTypeMap();
-    let func = $map->get($typeName);
-    let columnType = if ($func->isEmpty(), | ^meta::relational::metamodel::datatype::SemiStructured(), | $func->toOne()->eval(1000, 1));
-    let pureType = if($columnType->instanceOf(meta::relational::metamodel::datatype::SemiStructured), | [], | meta::relational::metamodel::datatype::dataTypeToCompatiblePureType($columnType));
+  let map = meta::relational::functions::database::sqlTextToRelationalDataTypeMap();
+  let func = $map->get($typeName);
+  let columnType = if ($func->isEmpty(), | ^meta::relational::metamodel::datatype::SemiStructured(), | $func->toOne()->eval(1000, 1));
+  let pureType = if($columnType->instanceOf(meta::relational::metamodel::datatype::SemiStructured), | [], | meta::relational::metamodel::datatype::dataTypeToCompatiblePureType($columnType));
 }
