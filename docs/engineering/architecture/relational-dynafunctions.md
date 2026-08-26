@@ -376,8 +376,8 @@ Sybase ASE `:88-89`, SparkSQL `:78-79`, Oracle `:188-189` and Sybase IQ `:79-80`
 Five registered names have **no** `dynaFnToSql` entry in any dialect: `between`, `case`,
 `explodeSemiStructured`, `not`, `pair` — and for four of them that is by design, not a gap.
 `case` and `not` are intercepted upstream (`processDynaFunction:867`, `:870`); `pair` is
-router-internal (`pureToSQLQuery.pure:4007` builds `newDynaFunction('pair', $roes)` and consumes
-it structurally, never rendering it); `explodeSemiStructured` is lowered by the router into a
+router-internal (`newDynaFunction('pair', $roes)` is built and consumed
+structurally, never rendered); `explodeSemiStructured` is lowered by the router into a
 lateral flatten join before SQL generation and so never reaches dispatch — see §11.7.
 
 ### 6.2 Renderable ≠ used
@@ -545,7 +545,7 @@ the dyna function registry has **three producers**, not one:
 2. **Router synthesis** — the router constructs `^DynaFunction(...)` directly in Pure against
    the M3 metamodel while translating Pure to SQL (`pureToSQLQuery.pure`, `calendarFunctions.pure`,
    `milestoning.pure`, graphFetch, postprocessors). These legitimately use names, shapes and
-   arities no human writes. `pair` (`pureToSQLQuery.pure:4007`) is the clean example: a
+   arities no human writes. `pair` (built by `newDynaFunction`) is the clean example: a
    registered name that exists only to carry a tuple between router stages.
 3. **Upstream Pure grammar** — `###Relational` written in a `.pure` source file is parsed by an
    independent ANTLR implementation in the `legend-pure-m2-store-relational-grammar` jar, which
@@ -903,10 +903,10 @@ Array flattening from the Database DSL **already works**. The gap is narrower th
 sits in *where* you may write the call rather than in missing machinery.
 
 **The lowering exists.** `applyJoinWithExplodeInCondition`
-(`pureToSQLQuery.pure:9229-9337`, triggered at `:9159` by `explodeInCurrentJoinOperation`)
+(triggered by `explodeInCurrentJoinOperation`)
 rewrites a grammar-authored `explodeSemiStructured` into a `SemiStructuredArrayFlatten` relation,
 a `JoinTreeNode(lateral = true)`, and a `SemiStructuredArrayFlattenOutput` column named `VALUE`,
-then substitutes the dyna node out of the predicate (`:9288`). After lowering the outer predicate
+then substitutes the dyna node out of the predicate. After lowering the outer predicate
 sees an ordinary subquery column, not a dyna function.
 
 **So array-backed `[*]` properties are authorable today.**
@@ -986,8 +986,8 @@ passes name, arity, path and return type through unchecked, `HelperRelationalBui
 | Path must match `(ident\|[N]\|["quoted"])(.ident\|[N]\|["quoted"])*` — no `[*]`, no `[-1]`, no `..`, no `a."k"`, no `$.a` | `dbExtension.pure:918-921`, asserted `:910` |
 | Return type is one of exactly 10 scalars; **no `ARRAY`/`SEMISTRUCTURED`/`VARIANT`/`JSON`** | `dbExtension.pure:912-913` |
 | Neither check runs on the dialect-translation path | `toPostgresModel.pure:1055-1066` |
-| `explodeSemiStructured` is legal **only inside a Join**; elsewhere it compiles then dies with `[unsupported-api] … is not supported yet` | `pureToSQLQuery.pure:9158`; `dbExtension.pure:1040` |
-| At most one *unique* explode per Join; operand must be a plain `TableAliasColumn` of a table or view; source needs ≥1 primary key | `pureToSQLQuery.pure:9236`, `:9239`, `:9245-9248` |
+| `explodeSemiStructured` is legal **only inside a Join**; elsewhere it compiles then dies with `[unsupported-api] … is not supported yet` | `explodeInCurrentJoinOperation`; `dbExtension.pure:1040` |
+| At most one *unique* explode per Join; operand must be a plain `TableAliasColumn` of a table or view; source needs ≥1 primary key | `applyJoinWithExplodeInCondition` |
 | Array operations are unavailable across a **join-based** binding (`prop: Binding … : @Join \| …`) | `pureToSQLQuery_variant.pure:179-200`, in-source comment |
 
 **Behavioural gaps, reproduced on DuckDB.** All four appear only in the *relation* query form
@@ -1014,9 +1014,9 @@ every one of these.
    `processVariantReverse` (`:349`) and `processVariantRemoveDuplicates` (`:427`) **do not** —
    each calls `processDynaFunction` with `$state` unchanged.
 
-   `max`/`min` fail one level earlier: their dispatch entries (`pureToSQLQuery.pure:10101-10122`)
+   `max`/`min` fail one level earlier: their dispatch entries in `getSupportedFunctions`
    pair only with `isVariantInputWithInstanceValue`, and carry no `isSemiStructuredArrayInput`
-   guard of the kind `size` has at `:10163`. So they never reach `processVariantMax` on a bound
+   guard of the kind `size` has. So they never reach `processVariantMax` on a bound
    to-many property at all.
 
    Observed on DuckDB:

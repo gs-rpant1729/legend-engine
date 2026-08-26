@@ -9,7 +9,7 @@ Patterns lifted from `Test_Relational_<Dialect>_{Essential,Standard,Grammar,Rela
 ## Cross-dialect recurring patterns
 
 - **Variant/Postgres model gap:** `add`, `concatenate`, `drop`, `get`, `keys`, `put`/`putAll`, `values`, `head`/`init`, `indexOf` often fail on H2 with `"Couldn't find DynaFunction to Postgres model translation for toVariantList()."` or `toVariantObject()`. Origin: `core_relational/relational/sqlDialectTranslation/toPostgresModel.pure:264`. Indicates the new legend-SQL pipeline Postgres-model converter lacks a binding for the variant-building dyna-functions.
-- **forAll:** `No SQL translation exists for the PURE function 'forAll_T_MANY__Function_1__Boolean_1_'` is universal — forAll is not wired for SQL at all. Origin: `pureToSQLQuery.pure:2349`.
+- **forAll:** `No SQL translation exists for the PURE function 'forAll_T_MANY__Function_1__Boolean_1_'` is universal — forAll is not wired for SQL at all. Origin: `pureToSQLQuery_core.pure` (no `getSupportedFunctions` dispatch entry).
 - **Fold:** Frequently fails with `Match failure: FoldRelationalLambdaObject instanceOf FoldRelationalLambda` or platform-copy errors; fold-in-SQL is fragile.
 - **Array aggregates (array_max/array_min/array_append/array_concatenate/array_drop/array_first/array_position):** absent on Postgres (`[unsupported-api] … is not supported yet`) and Oracle. DuckDB and ClickHouse implement them. Origin of the error wording: `dbExtension.pure:1041`.
 - **stdDev/variance/covar/corr:** Postgres reports `Unused format args. [N] arguments provided to expression "…(%s, %s)"` — the default formatter mismatches arity. Symptom of a mis-authored `ToSql(format=…)` in extensionDefaults or in the dialect.

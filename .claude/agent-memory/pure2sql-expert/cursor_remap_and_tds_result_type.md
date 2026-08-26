@@ -44,7 +44,7 @@ After bug 1 unblocks plan generation, the same test hits `java.lang.NullPointerE
 
 ### Two candidate fixes
 
-**(a) Pure-side (recommended root-cause fix)** — update `isResultColumnsDynamic` at `pureToSQLQuery.pure:6326-6329` to detect pivot inside nested subselects:
+**(a) Pure-side (recommended root-cause fix)** — update `isResultColumnsDynamic` (`pureToSQLQuery_queryBuilding.pure`) to detect pivot inside nested subselects:
 ```pure
 !$select.pivot->isEmpty() ||
 $select.columns->isEmpty() ||

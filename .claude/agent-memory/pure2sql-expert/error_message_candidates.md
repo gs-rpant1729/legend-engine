@@ -8,7 +8,7 @@ These are the highest-leverage error sites to improve — each appears hundreds 
 
 ## 1. `No SQL translation exists for the PURE function '<sig>'`
 
-- **Origin:** `legend-engine-xts-relationalStore/legend-engine-xt-relationalStore-generation/legend-engine-xt-relationalStore-pure/legend-engine-xt-relationalStore-core-pure/src/main/resources/core_relational/relational/pureToSQLQuery/pureToSQLQuery.pure:2349`.
+- **Origin:** `legend-engine-xts-relationalStore/legend-engine-xt-relationalStore-generation/legend-engine-xt-relationalStore-pure/legend-engine-xt-relationalStore-core-pure/src/main/resources/core_relational/relational/pureToSQLQuery/pureToSQLQuery_core.pure` (no `getSupportedFunctions` dispatch entry).
 - **Current wording:** `'No SQL translation exists for the PURE function \'…\'. \nIf you would like to add a SQL translation for the function then follow the step-by-step guide on the PURE wiki.'`
 - **Gap:** no dialect name, no source info (Pure `SourceInformation` not threaded here), no list of siblings that ARE supported. Typical hit: `forAll_T_MANY__Function_1__Boolean_1_`, `add_T_MANY__Integer_1__T_1__T_$1_MANY$_`.
 - **Improvement target:** include the `DatabaseType`, the dyna-function name attempted, and a pointer to `docs/pct/wiring-howto.md`.
@@ -29,7 +29,7 @@ These are the highest-leverage error sites to improve — each appears hundreds 
 
 ## 4. `<typename> is not managed yet!`
 
-- **Origin:** `pureToSQLQuery.pure:9758` — `fail ($genericType->printGenericType(false) + ' is not managed yet!')`. Appears in `testConcatenateMixedType` as `Any is not managed yet!`.
+- **Origin:** `pureToSQLQuery_joinTree.pure` — `fail ($genericType->printGenericType(false) + ' is not managed yet!')`. Appears in `testConcatenateMixedType` as `Any is not managed yet!`.
 - **Gap:** `Any` is a meaningless word to users; doesn't say what stage of type dispatch this is.
 - **Improvement target:** clarify that this is literal-type inference inside `processValueSpecification`, include the function context and the Pure call stack frame.
 

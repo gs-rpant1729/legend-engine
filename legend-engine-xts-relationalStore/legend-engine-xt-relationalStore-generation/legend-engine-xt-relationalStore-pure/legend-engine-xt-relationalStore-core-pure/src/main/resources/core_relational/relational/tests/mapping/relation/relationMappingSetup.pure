@@ -286,7 +286,7 @@ Class meta::relational::tests::mapping::relation::PersonLiftedConcat
 // Type-rejection case: `attributes` is Map<String,Variant>[1], a
 // structural container that the router must reject at plan time. Map is a
 // Class instance (passes instanceOf(Class)) but is explicitly excluded by
-// the isStructuralContainer check at pureToSQLQuery.pure:1944.
+// the isStructuralContainer check in pureToSQLQuery_core.pure.
 Class meta::relational::tests::mapping::relation::PersonLiftedUnsupported
 {
   attributes: meta::pure::functions::collection::Map<String, meta::pure::metamodel::variant::Variant>[1];

@@ -1,0 +1,2185 @@
+// Copyright 2026 Goldman Sachs
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+// Scalar function library, window frame, and aggregation processing functions.
+// Factored out of pureToSQLQuery.pure. Same namespace
+// (meta::relational::functions::pureToSqlQuery::*) so dispatcher mangled-FQN
+// entries and external references are unchanged.
+
+import meta::pure::mapping::modelJoin::*;
+import meta::pure::functions::string::generation::*;
+import meta::pure::precisePrimitives::*;
+import meta::pure::functions::hash::*;
+import meta::pure::metamodel::variant::*;
+import meta::external::format::shared::binding::*;
+import meta::pure::router::metamodel::clustering::*;
+import meta::pure::router::metamodel::*;
+import meta::pure::router::store::routing::*;
+import meta::core::runtime::*;
+import meta::pure::executionPlan::*;
+import meta::pure::extension::*;
+import meta::pure::functions::collection::*;
+import meta::relational::extension::*;
+import meta::alloy::objectReference::*;
+import meta::external::store::relational::runtime::*;
+import meta::relational::runtime::*;
+import meta::relational::functions::pureToSqlQuery::*;
+import meta::relational::functions::pureToSqlQuery::union::*;
+import meta::relational::functions::pureToSqlQuery::metamodel::*;
+import meta::pure::metamodel::valuespecification::*;
+import meta::relational::mapping::*;
+import meta::relational::metamodel::*;
+import meta::relational::metamodel::operation::*;
+import meta::relational::metamodel::relation::*;
+import meta::relational::metamodel::join::*;
+import meta::relational::functions::pureToSqlQuery::relationalmappingspecification::*;
+import meta::pure::mapping::*;
+import meta::pure::mapping::relation::*;
+import meta::pure::metamodel::path::*;
+import meta::pure::metamodel::serialization::grammar::*;
+import meta::pure::milestoning::*;
+import meta::pure::tds::*;
+import meta::relational::functions::*;
+import meta::relational::milestoning::*;
+import meta::pure::router::clustering::*;
+import meta::pure::router::printer::*;
+import meta::pure::router::routing::*;
+import meta::pure::router::store::embedded::*;
+import meta::pure::router::store::metamodel::*;
+import meta::pure::router::store::metamodel::clustering::*;
+import meta::pure::router::utils::*;
+
+function meta::relational::functions::pureToSqlQuery::processFunctionDefinition(funcDefinition: FunctionDefinition<Any>[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):OperationWithParentPropertyMapping[*]
+{
+  let expressions = $funcDefinition.expressionSequence;
+
+  let ctesAndScopes = $expressions->init()->fold({c, ctesAndScopes |
+        let ctes = $ctesAndScopes.first.values;
+        let scopes = $ctesAndScopes.second.values->head();
+
+        let e = $c->byPassValueSpecificationWrapper();
+        let varName = $e->extractLetVariableName()->toOne('Multi expression that are not let statement are not supported!');
+        let varValue = $e->cast(@SimpleFunctionExpression).parametersValues->evaluateAndDeactivate()->at(1);
+
+        let returnType = $e->cast(@SimpleFunctionExpression).genericType;
+
+        let sqlQuery = $varValue->match([
+                sc:StoreMappingClusteredValueSpecification[1] |
+                  $sc.val->processQuery(^$state(mapping = $sc.mapping, inScopeVars = $state.inScopeVars->putAll($sc.openVars), idToClassMapping = if ($sc.mapping == $state.mapping, | $state.idToClassMapping, | buildClassMappingsById($sc.mapping)))->withFunctionParamScope($scopes), $context->shift(), $extensions);,
+                sc:StoreClusteredValueSpecification[1] |
+                  $sc.val->processQuery(^$state(inScopeVars = $state.inScopeVars->putAll($sc.openVars))->withFunctionParamScope($scopes), $context->shift(), $extensions);,
+                s:StoreMappingRoutedValueSpecification[1] |
+                  $s->processQuery(^$state(mapping = $s.mapping, idToClassMapping = if($s.mapping == $state.mapping, | $state.idToClassMapping, | buildClassMappingsById($s.mapping)))->withFunctionParamScope($scopes), $context->shift(), $extensions);,
+                vs: ValueSpecification[1] |
+                  $vs->processQuery($state->withFunctionParamScope($scopes), $context->shift(), $extensions);,
+                a: Any[1] |
+                  fail($a->type()->elementToPath() + ' not supported on multi expression')->cast(@SelectWithCursor)->toOne();
+        ]);
+
+        let letSelectResult = $sqlQuery.select;
+
+        let colAsAlais = $letSelectResult.columns->toIndexed()->map(c|
+          $c.second->match([
+            a: Alias[1] | $a,
+            tac: TableAliasColumn[1] | $tac,
+            roe: RelationalOperationElement[1] | ^Alias(name = 'col_%d'->format($c.first), relationalElement = $roe)
+          ]);
+        );
+
+        let cteSelect = ^$letSelectResult(columns = $colAsAlais);
+
+        let newCtes = $ctes->concatenate(^CommonTableExpression(name = $varName, sqlQuery = $cteSelect));
+
+        let cteColumns = $cteSelect.columns->map(c |
+              $c->match([
+                a: Alias[1] | ^Column(name = $a.name, type = ^meta::relational::metamodel::datatype::Other()),
+                tac: TableAliasColumn[1] | ^Column(name = $tac.columnName->orElse($tac.column.name), type = $tac.column.type)
+              ]);
+        );
+        let cteReference = ^CommonTableExpressionReference(name = $varName, columns = $cteColumns);
+        let cteAlias = ^TableAlias(name = $varName + '_' +$nodeId, relationalElement = $cteReference);
+        
+        let cteReferenceSelect = ^TdsSelectSqlQuery
+        (
+          columns = $cteColumns->map(c | ^TableAliasColumn(columnName = $c.name, column = $c, alias = $cteAlias)),
+          data = ^RootJoinTreeNode(alias = $cteAlias),
+          paths =  $cteColumns->map(c| pair($c.name, ^PathInformation(type = $c->meta::relational::metamodel::datatype::pureTypeForDbColumn(), relationalType = $c.type)))
+        );
+
+        let newScope = ^FunctionParamScope(
+          parent = $scopes,
+          varToSelect = newMap(pair($varName, ^$operation(select = $cteReferenceSelect)))
+        );
+
+        pair(list($newCtes), list($newScope));
+      },
+      pair(list([]->cast(@CommonTableExpression)), list($state.functionReferenceScope))
+  );
+
+  let currSelect = $operation.select;
+  let ctes = $ctesAndScopes.first.values;
+  let scopes = $ctesAndScopes.second.values->head();
+  let result = processValueSpecificationReturnPropertyMapping($expressions->last()->toOne(), $currentPropertyMapping, ^$operation(select = $currSelect), $vars, $state->withFunctionParamScope($scopes), $joinType, $nodeId, $aggFromMap, $context->shift(), $extensions);
+
+  if ($ctes->isNotEmpty(),
+    |
+      assertEquals($result->size(), 1, |'multi expression should yield single operation');
+      let singleResult = $result->toOne();
+      $singleResult.element->match([
+        selectWithCursor: SelectWithCursor[1] |
+          let select = $selectWithCursor.select;
+          ^$singleResult(element = ^$selectWithCursor(select = ^$select(commonTableExpressions += $ctes)));,
+        any: Any[1] | fail($any->type()->elementToPath() + ' not supported for multi expression'); $singleResult;
+      ]);
+    ,
+    |
+      $result
+  );
+}
+
+function meta::relational::functions::pureToSqlQuery::processFunctionExpressionForNonPropertyFunction(functionExpression:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):OperationWithParentPropertyMapping[*]
+{
+   let func = findSupportedFunction($functionExpression, $vars, $state);
+
+   if ([
+         pair(
+          |!$func->isEmpty(),
+          | let params1 = [^List<Any>(values=$functionExpression), ^List<Any>(values=$currentPropertyMapping)];
+            let params = $params1->concatenate([$operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context]->map(v | ^List<Any>(values=$v)))->concatenate(^List<Any>(values = $extensions));
+            print(if(!$context.debug, |'', | $context.space+'>Process Function Expression using supported function: '+ $func.name->orElse('unknown') + '\n'));
+            $func->toOne()->evaluate($params)->cast(@RelationalOperationElement)->toOne()->wrapIfNecessary();
+         ),
+         pair(
+          | $functionExpression.func->instanceOf(FunctionDefinition),
+          | $functionExpression.func->cast(@FunctionDefinition<Any>)->processFunctionDefinition($currentPropertyMapping, $operation, $functionExpression->mapVariables($vars, $state.inScopeVars), $state, $joinType, buildNodeId($nodeId, '_fd'), $aggFromMap, $context, $extensions);
+         )
+       ],
+       |fail('No SQL translation exists for the PURE function \''+$functionExpression.func.name->toOne()+'\'. \nIf you would like to add a SQL translation for the function then follow the step-by-step guide on the PURE wiki.'); $operation->wrapIfNecessary();
+   );
+}
+
+function meta::relational::functions::pureToSqlQuery::flattenConcatenate(f:ValueSpecification[1]):ValueSpecification[*]
+{
+   $f->match([
+      fe:FunctionExpression[1] | if ($fe.func->in([
+                                            concatenate_T_MANY__T_MANY__T_MANY_, union_T_MANY__T_MANY__T_MANY_,
+                                            concatenate_TabularDataSet_1__TabularDataSet_1__TabularDataSet_1_,
+                                            concatenate_TabularDataSet_1__TabularDataSet_MANY__TabularDataSet_1_,
+                                            concatenate_Relation_1__Relation_1__Relation_1_
+                                            ]),
+                                       | $fe.parametersValues->at(0)->flattenConcatenate()->concatenate($fe.parametersValues->at(1)->flattenConcatenate()),
+                                       | $fe
+                                 );,
+      iv:InstanceValue[1]| $iv.values->match([
+                              v:ValueSpecification[*]|$v,
+                              a:Any[*]| $iv
+                                ]),
+      v:ValueSpecification[1] | $v
+   ])
+}
+
+function meta::relational::functions::pureToSqlQuery::processConcatenate(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   let targetType =  $f.genericType.rawType->toOne();
+   let isDataType = $targetType->instanceOf(DataType);
+   assert(!$f.genericType.rawType->toOne()->instanceOf(Enum), 'Enumerations are not yet supported in this context');
+
+   let elements = $f->flattenConcatenate();
+
+   let processed_pre = $elements->map(e|$e->processValueSpecificationReturnPropertyMapping($currentPropertyMapping, $operation, $vars, ^$state(shouldIsolateNestedFilter=false, importDataFlowCurrentSetOffsetInUnion=$elements->indexOf($e)), $joinType, $nodeId, $aggFromMap, $context, $extensions)->toOne(););
+
+   let processed = $processed_pre->map(p|let selectWithCursor = $p.element->cast(@SelectWithCursor);
+                                         let select = $selectWithCursor.select;
+
+                                         let newSelect = if ($select.extraFilteringOperation->isEmpty(),
+                                                                |$select,
+                                                                |^$select(extraFilteringOperation=[],
+                                                                          filteringOperation=$select.filteringOperation->concatenate($select.extraFilteringOperation->removeDuplicatesBy(f|$f->buildUniqueName(true, $extensions)))->andFilters($extensions)
+                                                                 )
+                                                         );
+                                         let newSelectWithCursor = ^$selectWithCursor(select = $newSelect);
+                                         ^$p(element = $newSelectWithCursor);
+                                   );
+
+   let setImpl = if($isDataType || $targetType ->_subTypeOf(TabularDataSet) || $targetType ->_subTypeOf(meta::pure::metamodel::relation::Relation),|[],|$elements->map(e|$e->cast(@StoreMappingRoutedValueSpecification).sets->toOne())->removeDuplicates());
+   let res = if ($operation.select.data->isEmpty(),
+      |// Align columns across union arms (all arms must have the same columns for SQL UNION ALL)
+       let columns = $processed.element->cast(@SelectWithCursor).select.columns;
+       let transformed = if (!$columns->isEmpty() && $columns->forAll(c | $c->instanceOf(Alias) || $c->instanceOf(TableAliasColumn)),
+                              | $processed->map(p|let selectWithCursor = $p.element->cast(@SelectWithCursor);
+                                                  let select = $selectWithCursor.select->alignJoinAndPkColumnsForUnion($columns);
+                                                  let element = $elements->at($processed->indexOf($p));
+                                                  let type = if($isDataType || $targetType ->_subTypeOf(TabularDataSet) || $targetType ->_subTypeOf(meta::pure::metamodel::relation::Relation),
+                                                                |[],
+                                                                |^Alias
+                                                                 (
+                                                                    name='u_type',
+                                                                    relationalElement=^Literal(value=$setImpl->indexOf($element->cast(@StoreMappingRoutedValueSpecification).sets->toOne())->toString())
+                                                                 )
+                                                             );
+                                                  let newSelect = ^$select(columns = $type->concatenate($select.columns));
+                                                  let newSelectWithCursor = ^$selectWithCursor(select = $newSelect);
+                                                  ^$p(element = $newSelectWithCursor);
+                                             );,
+                              | $processed
+                        );
+
+       print(if(!$context.debug, |'', | $transformed->map(t|$context.space+' >Result: '+$t.element->cast(@SelectWithCursor).select->meta::relational::functions::sqlQueryToString::processOperation(meta::relational::runtime::DatabaseType.DebugPrint, $extensions)+'\n')->makeString('')));
+       let firstSel = $transformed->at(0).element->cast(@SelectWithCursor).select;
+
+       let selects = $transformed.element->cast(@SelectWithCursor).select->map(s | $s->pushSavedFilteringOperation($extensions));
+
+       let rootTable = ^TableAlias(
+                                     name = 'union',
+                                     relationalElement = if($f.functionName == 'union',
+                                                             |^Union(
+                                                                   queries = $selects
+                                                               ),
+                                                             |^UnionAll(
+                                                                   queries = $selects
+                                                              )
+                                                          )
+                       );
+
+       let newRoot = ^RootJoinTreeNode(alias = $rootTable);
+       ^SelectWithCursor(
+          select = ^$firstSel(
+                         columns = $transformed.element->cast(@SelectWithCursor).select->at(0).columns
+                                      ->map(c|$c->match([a:Alias[1]|^$a(relationalElement=^TableAliasColumn(column=^Column(name=$a.name, type=^meta::relational::metamodel::datatype::Integer()), alias=$rootTable)),
+                                                         t:TableAliasColumn[1]|^$t(alias=$rootTable),
+                                                         s:SemiStructuredArrayFlattenOutput[1]|let colName = $s->extractColumnName(); ^Alias(name = $colName, relationalElement = ^TableAliasColumn(column = ^Column(name = $colName, type = ^meta::relational::metamodel::datatype::SemiStructured()), alias = $rootTable));
+                                                        ])),
+                         data = $newRoot,
+                         savedFilteringOperation = [],
+                         leftSideOfFilter = if($firstSel.leftSideOfFilter->isEmpty(),|[],|$newRoot),
+                         filteringOperation = [],
+                         havingOperation = [],
+                         groupBy = [],
+                         qualifyOperation = []
+                   ),
+         currentTreeNode = $newRoot
+       );,
+      |let propertyName = $processed->map(t|if ($t.currentPropertyMapping->isEmpty(), |$t.element->cast(@SelectWithCursor).select.columns->map(c|$c->buildUniqueName(false, $extensions))->makeString('_'), |$t.currentPropertyMapping.property.name->toOne());)->removeDuplicates()->makeString('_')->addQuotesIfNecessary();
+
+       // Build new Select
+       let newSelectsWithCutNode = $processed->map(t| let nodeToCut = $operation.select.data->toOne()->findOneNode($operation.currentTreeNode->toOne(), $t.element->cast(@SelectWithCursor).select.data->toOne());
+                                                        let newSelect = if ($nodeToCut->children()->isEmpty(),
+                                                                        |let select = $t.element->cast(@SelectWithCursor).select;
+                                                                         let withSelf = $select->addSelfJoin($nodeToCut->toOne(), $select.columns->map(q|$q->buildUniqueName(false, $extensions))->makeString('_'), $extensions).first;
+                                                                         let oldToNew = ^OldAliasToNewAlias(first=$withSelf.data.alias.name->toOne(), second=$withSelf.data->map(x|$x->children()).alias->toOne());
+                                                                         let withSelfReprocessed = ^$withSelf
+                                                                                                   (
+                                                                                                      columns = $withSelf.columns->map(c|$c->reprocessAliases($oldToNew)),
+                                                                                                      savedFilteringOperation = $withSelf.savedFilteringOperation->map(p|pair($withSelf.data->map(x|$x->children())->toOne(), $p.second->reprocessAliases($oldToNew)))
+                                                                                                   );
+                                                                         let child = $withSelfReprocessed.data->toOne()->children()->toOne();
+                                                                         pair($child, buildConcatenateSubSelect($child, $withSelfReprocessed, $isDataType, $propertyName, $state.inFilter, $extensions));,
+                                                                        |let child = $nodeToCut->children()->toOne();
+                                                                         pair($child, buildConcatenateSubSelect($child, $t.element->cast(@SelectWithCursor).select, $isDataType, $propertyName, $state.inFilter, $extensions));
+                                                                    );
+                                                 );
+       print(if(!$context.debug, |'', | $processed->zip($newSelectsWithCutNode.second)->map(t|$context.space+' >Result: '+$t.first.element->cast(@SelectWithCursor).select->meta::relational::functions::sqlQueryToString::processOperation(meta::relational::runtime::DatabaseType.DebugPrint, $extensions)+'\n'+
+                                                                                                $context.space+' >Result reprocessed: '+$t.second->meta::relational::functions::sqlQueryToString::processOperation(meta::relational::runtime::DatabaseType.DebugPrint, $extensions)+'\n'
+                                                                                             )->makeString('')
+             )
+       );
+
+
+       let currentTreeNodes = $newSelectsWithCutNode.second->map(t|$t.data->toOne()->findLastJoinTreeNode());
+
+       let setImplementationIds = if($processed->at(0).currentPropertyMapping.targetSetImplementationId == '',|[],
+                                                                                                                |$processed->map(t| if ($t.currentPropertyMapping->isEmpty(),
+                                                                                                                                             |[],
+                                                                                                                                             |$t.currentPropertyMapping->match([
+                                                                                                                                                 e:EmbeddedRelationalInstanceSetImplementation[1]| $e,
+                                                                                                                                                 p:PropertyMapping[1]| $state->getClassMappingById($t.currentPropertyMapping.targetSetImplementationId->toOne())->toOne()
+                                                                                                                                                 ])
+                                                                                                                                         )
+                                                                                                                                   ));
+
+       let newQueries = $newSelectsWithCutNode.second->map(s | $s->alignJoinAndPkColumnsForUnion($newSelectsWithCutNode.second.columns));
+
+       let optimized = $newQueries->map(q|if($q.data.alias.relationalElement->toOne()->instanceOf(UnionAll),|$q.data.alias.relationalElement->cast(@UnionAll).queries,|$q));
+
+       let union = if($f.functionName == 'union',
+                      |^Union(queries = $optimized,
+                              currentTreeNodes = $currentTreeNodes,
+                              setImplementations = $setImplementationIds
+                       ),
+                      |^UnionAll(queries = $optimized,
+                                 currentTreeNodes = $currentTreeNodes,
+                                 setImplementations = $setImplementationIds
+                       )
+                   );
+
+       print(if(!$context.debug, |'', | $context.space+' >Union: '+$union->meta::relational::functions::sqlQueryToString::processOperation(meta::relational::runtime::DatabaseType.DebugPrint, $extensions)+'\n'));
+
+       let unionNode = ^TableAlias(name = 'union'+$nodeId, relationalElement = $union);
+
+
+       let newJoins = $newSelectsWithCutNode.first->map(c|let oldToNew = ^OldAliasToNewAlias(first=$c.alias.name, second=$unionNode);
+                                                          let newJoin = $c.join->reprocessJoin($oldToNew, []);
+                                                    );
+
+       let firstJoin = $newJoins->at(0);
+       let firstChild = $newSelectsWithCutNode->at(0).first;
+       let joinY = ^$firstJoin(operation = $newJoins->removeDuplicatesBy(x | $x.name).operation->orFilters($extensions)->cast(@Operation)->toOne());
+       let newChild = ^$firstChild(alias=$unionNode, join=$joinY, childrenData=[]);
+
+       let sel = $operation.select;
+       let data = $sel.data->toOne();
+       let newRoot = if ($data->children()->isEmpty(),
+                          | ^$data(childrenData=$newChild),
+                          | fail('use replaceTreeNode');$data->replaceTreeNode($operation.currentTreeNode->toOne(), $newChild)->cast(@RootJoinTreeNode);
+                     );
+
+
+       // No need to take both (they should be merged already)
+       ^SelectWithCursor(
+          select = ^$sel
+                   (
+                      columns = if($isDataType && !$state.inFilter,
+                                      |let oldToNew = ^OldAliasToNewAlias(first=$firstChild.alias.name, second=$unionNode);
+                                       let alias = $optimized->at(0).columns->at(0)->reprocessAliases($oldToNew)->cast(@Alias);
+                                       ^TableAliasColumn(alias=$unionNode, column=^Column(name=$alias.name, type=^meta::relational::metamodel::datatype::Integer()));,
+                                      |[]
+                                ),
+                      savedFilteringOperation = [],
+                      data = $newRoot,
+                      leftSideOfFilter = if($sel.leftSideOfFilter->isEmpty(),|[],|$sel.leftSideOfFilter->toOne()->findOneNode($data, $newRoot)),
+                      filteringOperation = if($isDataType && $state.inFilter, |^TableAliasColumn(alias = $unionNode, column = ^Column(name=$propertyName, type=^meta::relational::metamodel::datatype::Integer())), |[])
+                   ),
+          currentTreeNode = $newChild
+       );
+   );
+
+   print(if(!$context.debug, |'', | $context.space+' >Union Result: '+$res.select->meta::relational::functions::sqlQueryToString::processOperation(meta::relational::runtime::DatabaseType.DebugPrint, $extensions)+'\n'));
+
+   $res;
+}
+
+function meta::relational::functions::pureToSqlQuery::buildConcatenateSubSelect(child:RelationalTreeNode[1], leftSelect:SelectSQLQuery[1], isDataType:Boolean[1], propertyName:String[1], inFilter:Boolean[1], extensions:Extension[*]):SelectSQLQuery[1]
+{
+   let extraCol = if($isDataType,
+                     |let c = if($inFilter,|$leftSelect.filteringOperation->toOne(),
+                                           |$leftSelect.columns->toOne()
+                      );
+                     ^Alias(name=$propertyName, relationalElement=$c);,
+                     |[]
+                  );
+   let newNode = ^RootJoinTreeNode(alias = $child.alias, childrenData = $child.childrenData);
+   let newSelect = ^SelectSQLQuery(
+                                     data = $newNode,
+                                     columns = $extraCol->concatenate($child->cast(@JoinTreeNode)
+                                                     ->extractTableAliasColumns()
+                                                     ->filter(n|$n.alias == $child.alias)
+                                                     ->map(t:TableAliasColumn[1]|^Alias(name=$t.column.name, relationalElement=$t)))
+                                                     ->removeDuplicates(),
+                                     filteringOperation = if($isDataType,|[],|$leftSelect.filteringOperation)->concatenate($leftSelect.savedFilteringOperation.second)
+                                                          ->removeDuplicatesBy(f|$f->buildUniqueName(false, $extensions))
+                                                          ->andFilters($extensions)
+                                  );
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::alignJoinAndPkColumnsForUnion(select: SelectSQLQuery[1], allColumns:RelationalOperationElement[*]):SelectSQLQuery[1]
+{
+   let allCols = $allColumns->map(c | $c->extractColumnName())->removeDuplicates();
+
+   let sqlNull = ^Literal(value=^SQLNull());
+   let newCols = $allCols->map(a| let col = $select.columns->filter(c|$c->extractColumnName() == $a);
+                                  if ($col->isEmpty(),
+                                      |^Alias(name=$a, relationalElement=$sqlNull),
+                                      |$col->at(0)
+                                  );
+                           );
+   ^$select(columns = $newCols);
+}
+
+function meta::relational::functions::pureToSqlQuery::processNoOp(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   //Ignores the function and only processes the first parameter
+   processValueSpecificationReturnPropertyMapping($f.parametersValues->at(0), $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)->toOne()
+}
+
+function meta::relational::functions::pureToSqlQuery::processContextOnlyFunctionFallback(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   // Final-catchall handler for context-registered functions when no earlier applicability
+   // predicate matched. Registered as the LAST (predicate, handler) pair — guarded by
+   // `{fe, vars, state | true}` — for context-only functions that have no real static
+   // processor of their own (today: `fold`, `isNotEmpty_Any_MANY`, `indexOf`, `instanceOf`).
+   //
+   // Reaching this fallback at PureToSQL plan-generation time is almost always a bug:
+   // either an earlier context predicate should have fired here but a State field it
+   // reads was not propagated to this call site, or the FE shape is unsupported and was
+   // claimed at clustering time in error (via the unconditional-true entry in
+   // `getClusteringContextPredicates`). We fail loudly with a diagnostic so the gap is
+   // visible at plan-gen time rather than producing silently-wrong SQL.
+   fail('No relational processor matched function \'' + $f.functionName->orElse('<unknown>')
+        + '\'. The function is registered in getContextBasedSupportedFunctions as a '
+        + 'context-only entry; reaching this catchall means none of its earlier '
+        + 'applicability predicates matched the current State during plan generation. FE: '
+        + $f->meta::pure::router::printer::asString());
+   $operation;
+}
+
+function meta::relational::functions::pureToSqlQuery::processCast(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+  // support casting to relation type, e.g. ->cast(@Relation<someCol:String>)
+  // NOTE: another strategy we can adopt here is to treat this as a noop, e.g. from SQL generation perspective, this is just as fine
+  // because SQL does not check for availability of columns in sub-select, but in Pure, using cast(Relation) helps with type checking
+  // so we get the best of both world. But making this a noop, also means we allow empty column data, which means SELECT *, and that
+  // behavior is not being handled really well by the Pure to SQL engine in general, for example, findAliasOrFail() would throw.
+  if (!$f.parametersValues->at(1).genericType.typeArguments->isEmpty() && $f.parametersValues->at(1).genericType.typeArguments.rawType->size() == 1 && $f.parametersValues->at(1).genericType.typeArguments.rawType->toOne()->instanceOf(meta::pure::metamodel::relation::RelationType),
+    |
+      let mainQuery = processValueSpecification($f.parametersValues->at(0), $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)->toOne()->cast(@SelectWithCursor);
+      let mainSelect = $mainQuery.select;
+      if ($mainSelect.columns->isEmpty(),
+        |
+          ^$mainQuery(
+              select = ^$mainSelect(
+                columns = $f.parametersValues->at(1).genericType.typeArguments.rawType->toOne()->cast(@meta::pure::metamodel::relation::RelationType<Any>)->relationTypeColumnAliases($mainSelect.data.alias->toOne())
+              )
+          );,
+        |
+            $mainQuery
+      );
+      ,
+    | processValueSpecificationReturnPropertyMapping($f.parametersValues->at(0), $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)->toOne();
+  );
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::relationTypeColumnAliases(rel:meta::pure::metamodel::relation::RelationType<Any>[1], alias: TableAlias[1]):Alias[*]
+{
+  $rel.columns->map(
+                c|
+                  let colName = $c.name->toOne();
+                  let colType = $c.classifierGenericType.typeArguments->at(1);
+                  let mayQuotePivotColNames = if ($colName->contains('__|__') && !$colName->startsWith('\'') && !$colName->endsWith('\''),|'\''+$colName+'\'',|$colName);
+                  ^Alias(name=$colName->addQuotesIfNecessary(),relationalElement=^TableAliasColumn(alias=$alias,column=^Column(name=$mayQuotePivotColNames->addQuotesIfNecessary(), type=meta::relational::transform::fromPure::pureTypeToDataType($colType)->toOne())));
+              );
+}
+
+function meta::relational::functions::pureToSqlQuery::processSplitPart(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+  //sql is 1 index based, pure is 0 index based
+  let position = $f.parametersValues->at(2)->zeroToOneBasedIndex();
+
+  let functionExpression = ^$f(parametersValues = [$f.parametersValues->at(0), $f.parametersValues->at(1), $position]);
+  $functionExpression->processDynaFunction($currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+}
+
+function meta::relational::functions::pureToSqlQuery::zeroToOneBasedIndex(v:ValueSpecification[1]):ValueSpecification[1]
+{
+  $v->match([
+      i:InstanceValue[1] | ^$i(values = $i.values->toOne()->cast(@Integer) + 1),
+      v:ValueSpecification[1] | ^SimpleFunctionExpression(multiplicity = PureOne, func = plus_Integer_MANY__Integer_1_, functionName = 'plus',
+                                                          genericType = ^GenericType(rawType = Integer), importGroup = system::imports::coreImport,
+                                                          parametersValues = ^InstanceValue(multiplicity = ZeroMany, genericType = ^GenericType(rawType = Integer), values = [
+                                                            $v,
+                                                            ^InstanceValue(multiplicity = PureOne, genericType = ^GenericType(rawType = Integer), values = 1)
+                                                          ]))->evaluateAndDeactivate()
+  ]);
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::processRegexpParameters(f:FunctionExpression[1], index:Integer[1]):FunctionExpression[1]
+{
+  let regexpParameters = $f.parametersValues->at($index)->reactivate()->cast(@meta::pure::functions::string::RegexpParameter);
+  let regexpParametersAsString = $regexpParameters->map(p | $p->toString())->joinStrings(',');
+  ^$f(parametersValues = $f.parametersValues->take($index)->add(^InstanceValue(values=$regexpParametersAsString, genericType=^GenericType(rawType=String), multiplicity=PureOne)));
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::processRegexpLike(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+  let processedFe = $f->processRegexpParameters(2);
+  $processedFe->processDynaFunction($currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::processRegexpCount(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+  let processedFe = $f->processRegexpParameters(2);
+  $processedFe->processDynaFunction($currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::processRegexpIndexOf(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+  let processedFe = $f->processRegexpParameters(3);
+  $processedFe->processDynaFunction($currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::processRegexpReplace(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+  let processedFe = $f->processRegexpParameters(4);
+  $processedFe->processDynaFunction($currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::processRegexpExtract(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+  let processedFe = $f->processRegexpParameters(4);
+  $processedFe->processDynaFunction($currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+}
+
+function meta::relational::functions::pureToSqlQuery::processHash(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+  let type = $f.parametersValues->at(1)->reactivate()->cast(@meta::pure::functions::hash::HashType)->toOne();
+  let name = meta::relational::functions::pureToSqlQuery::hashTypeToHashDynaFuncName($type);
+
+  let oldFunc = $f.func;
+  let functionExpression = ^$f(func = ^$oldFunc(functionName = $name->toOne()), parametersValues = $f.parametersValues->at(0));
+  $functionExpression->processDynaFunction($currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::hashTypeToHashDynaFuncName(hashType : meta::pure::functions::hash::HashType[1]): String[1]
+{
+  let name = newMap([
+    pair(meta::pure::functions::hash::HashType.MD5, 'md5'),
+    pair(meta::pure::functions::hash::HashType.SHA1, 'sha1'),
+    pair(meta::pure::functions::hash::HashType.SHA256, 'sha256')
+  ])->get($hashType);
+
+  assert($name->isNotEmpty(), | 'hash type ' + $hashType.name + ' is not yet supported');
+
+  $name->toOne();
+}
+
+// State-independent applicability predicate for ->at. AST shape only: 2 params, with
+// the receiver either unrouted or wrapped only in a NoSetRoutedValueSpecification
+function <<access.private>> meta::relational::functions::pureToSqlQuery::canProcessAt(f:FunctionExpression[1]):Boolean[1]
+{
+  let params = $f.parametersValues->evaluateAndDeactivate();
+  ($params->size() == 2) && (!$params->at(0)->instanceOf(RoutedValueSpecification) || $params->at(0)->instanceOf(NoSetRoutedValueSpecification));
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::processAt(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   let leftSide = $f.parametersValues->at(0);
+   let byPassedLeftSide = $leftSide->deepByPassRouterInfo();
+
+   let toManyPropertyCallCheck = {vs:ValueSpecification[1] |
+      $vs->instanceOf(SimpleFunctionExpression) &&
+      $vs->cast(@SimpleFunctionExpression).func->instanceOf(Property) &&
+      (!$vs->cast(@SimpleFunctionExpression).func->cast(@Property<Nil,Any|*>).multiplicity->hasToOneUpperBound())
+   };
+
+   let isToManyPropertyCall    = $toManyPropertyCallCheck->eval($byPassedLeftSide);
+   let isToManyPropertyAutomap = $byPassedLeftSide->instanceOf(SimpleFunctionExpression) &&
+                                 ($byPassedLeftSide->cast(@SimpleFunctionExpression).functionName == 'map') &&
+                                 ($byPassedLeftSide->cast(@SimpleFunctionExpression)->map({fe |
+                                    let mapFn = $fe.parametersValues->evaluateAndDeactivate()->at(1)->cast(@InstanceValue).values->cast(@meta::pure::metamodel::function::FunctionDefinition<Any>);
+                                    let mapExpr = $mapFn.expressionSequence->evaluateAndDeactivate();
+                                    ($mapExpr->size() == 1) && $toManyPropertyCallCheck->eval($mapExpr->toOne()->deepByPassRouterInfo());
+                                 }));
+
+   assert($isToManyPropertyCall || $isToManyPropertyAutomap,
+          | '->at(...) function is supported only after direct access of 1->MANY properties. Current expression: ' + $f->deepByPassRouterInfo()->cast(@FunctionExpression)->meta::pure::router::printer::asString());
+
+   let processedLeftSide = processValueSpecificationReturnPropertyMapping($f.parametersValues->at(0), $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)->toOne();
+   let propertyMappings = $processedLeftSide.currentPropertyMapping;
+
+   assert(($propertyMappings->size() >= 1) && $propertyMappings->forAll(pm | $pm->instanceOf(SemiStructuredRelationalPropertyMapping)),
+          | 'Expected semi structured property mappings. Got: ' + $propertyMappings->map(x | $x->genericType().rawType->toOne()->elementToPath())->joinStrings('[', ', ', ']'));
+
+   let preCollectionOp = processValueSpecification($f.parametersValues->at(0)->byPassRouterInfo()->cast(@SimpleFunctionExpression).parametersValues->at(0), $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)->toOne()->cast(@SelectWithCursor);
+   let collectionSWC = $propertyMappings->at(0)->cast(@SemiStructuredRelationalPropertyMapping).relationalOperationElement->processColumnsInRelationalOperationElements($state, $preCollectionOp, $nodeId, $aggFromMap, true, $context, $extensions)->cast(@SelectWithCursor);
+   let collectionSelect = $collectionSWC.select;
+
+   let arrayAccessBuilder = {r:RelationalOperationElement[*] |
+      assert($r->size() == 1, | 'Expected one relational operation element when processing \'at\'. Found: ' + $r->size()->toString());
+      assert($r->toOne()->instanceOf(SemiStructuredPropertyAccess), | '\'at\' function is supported only when accessing properties mapped to semi structured data');
+      let ssp = $r->toOne()->cast(@SemiStructuredPropertyAccess);
+      assert($ssp.index->isEmpty(), | 'Detected unexpected multiple \'at\' function application ->at(...)->at(...)');
+      let indexSelect = processValueSpecification($f.parametersValues->at(1), $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)->toOne()->cast(@SelectWithCursor).select;
+      ^$ssp(index = $state.inFilter->if(|$indexSelect.filteringOperation,|$indexSelect.columns)->toOne()->cast(@Literal));
+   };
+
+   let newSelect = $state.inFilter->if(|^$collectionSelect(filteringOperation = $arrayAccessBuilder->eval($collectionSelect.filteringOperation)),|^$collectionSelect(columns = $arrayAccessBuilder->eval($collectionSelect.columns)));
+   ^$processedLeftSide(element = ^$collectionSWC(select = $newSelect));
+}
+
+// State-independent applicability predicate for ->match. AST shape only: 2 params, with
+// the receiver either unrouted or wrapped only in NoSetRoutedValueSpecification. No
+// State / vars reads — required so this predicate can be evaluated at clustering time
+// (see isFunctionSupportedForCluster).
+function <<access.private>> meta::relational::functions::pureToSqlQuery::canProcessMatch(f:FunctionExpression[1]):Boolean[1]
+{
+   // Can process 'match' in the context of semi structured mappings (which are not routed).
+   let params = $f.parametersValues->evaluateAndDeactivate();
+   ($params->size() == 2) && (!$params->at(0)->instanceOf(RoutedValueSpecification) || $params->at(0)->instanceOf(NoSetRoutedValueSpecification));
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::processMatch(expression:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+  assert($expression.genericType.rawType->toOne()->instanceOf(PrimitiveType),'Match does not support Non-Primitive return type..! Current return type : '+ $expression.genericType.rawType->toOne()->toString());
+  let leftSide = $expression.parametersValues->at(0);
+  let byPassedLeftSide = $leftSide->deepByPassRouterInfo();
+
+  assert($byPassedLeftSide->cast(@ValueSpecification).multiplicity->isToOne(), 'Match only supports operands with multiplicity [1]..! Current operand : '+ $byPassedLeftSide->cast(@ValueSpecification)->meta::pure::router::printer::asString());
+  let leftSideOp = processValueSpecificationReturnPropertyMapping($leftSide, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)->toOne();
+  let processedLeftSide = $leftSideOp.element->cast(@SelectWithCursor);
+  let leftSelect = $processedLeftSide.select;
+
+  let checkCol = if($state.inFilter,|$leftSelect.filteringOperation, |$leftSelect.columns)->toOne();
+  //Currently hardcoding '@type' as a property.
+  let checkColType = ^SemiStructuredPropertyAccess(operand = $checkCol->cast(@SemiStructuredPropertyAccess),property = ^Literal(value = '@type'), returnType = String);
+  let propMapping = $leftSideOp.currentPropertyMapping;
+
+  let functions  = $expression->instanceValuesAtParameter(1, $vars, $state.inScopeVars)->cast(@meta::pure::metamodel::function::Function<Any>);
+  let processedFuncs = $functions->map(f|$f->processMatchFunctions($processedLeftSide, $vars, $state, $nodeId, $aggFromMap, $context->shift(), $extensions, $joinType, $propMapping));
+
+  let matchConclusions = $processedFuncs->map(x |  let select = $x.element->cast(@SelectWithCursor).select;
+                                            if($state.inFilter,|$select.filteringOperation, |$select.columns)->toOne();
+                                      );
+  let functionCount = $functions->size();
+  let allFunctionsSubtypes = $functions->size()->range()->map(ind | let functionType = $functions->at($ind)->meta::pure::functions::meta::functionType().parameters->at(0).genericType.rawType->toOne();
+                                                                    assertFalse($functionType->instanceOf(PrimitiveType), 'Match does not support checking on primitive data type..! Currently checking on : ' + $functionType->toString());
+                                                                    if($functionType == Any,
+                                                                    | assert($ind == $functionCount-1, 'Any should be used as a default type at the end of match');
+                                                                      [];,
+                                                                    |
+                                                                      list($functionType->cast(@Class<Any>)->meta::pure::functions::meta::allSpecializations())
+                                                                    );
+                                                            );
+
+  let matchConditions = $allFunctionsSubtypes->size()->range()->map(index | ^DynaFunction(name = 'in', parameters = [$checkColType,^LiteralList(values = $allFunctionsSubtypes->at($index).values.name->map(x | ^meta::relational::metamodel::Literal(value =$x)))]));
+  let matchConditionsWithConclusions = $allFunctionsSubtypes->size()->range()->map(index | $matchConditions->at($index)->concatenate($matchConclusions->at($index)));
+
+  let caseParams = if($matchConditions->size() == $functionCount - 1,
+                      |$matchConditionsWithConclusions->concatenate($matchConclusions->at($functionCount - 1)),
+                      |$matchConditionsWithConclusions->concatenate(^meta::relational::metamodel::Literal(value=^SQLNull()))
+                     );
+
+  let newSelect = $state.inFilter->if(|^$leftSelect(filteringOperation = ^DynaFunction(name = 'case', parameters = $caseParams)),|^$leftSelect(columns = ^DynaFunction(name = 'case', parameters = $caseParams)));
+  ^$processedLeftSide(select =$newSelect);
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::processMatchFunctions(f:meta::pure::metamodel::function::Function<Any>[1], query:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*],  joinType:JoinType[1], propMapping : PropertyMapping[*]):OperationWithParentPropertyMapping[1]
+{
+  assert($f->functionReturnMultiplicity() == PureZero || $f->functionReturnMultiplicity()->hasToOneUpperBound(), |'Match only supports lambdas with multiplicity [0..1] or [1]..! Current lambda : ' + $f->deepByPassRouterInfo()->cast(@meta::pure::metamodel::function::Function<Any>)->meta::pure::router::printer::asString());
+  let expression = $f->cast(@meta::pure::metamodel::function::FunctionDefinition<Any>).expressionSequence;
+  assertSize($expression, 1,'Lambdas  with more than one functionExpressions are not supported yet in Match..! The lambda \'' + $f->deepByPassRouterInfo()->cast(@meta::pure::metamodel::function::Function<Any>)->meta::pure::router::printer::asString() + '\' has ' + $expression->size()->toString() + ' expressions.');
+  processValueSpecificationReturnPropertyMapping($expression->toOne(),$propMapping, $query, $vars, $state, $joinType, $nodeId, $aggFromMap, $context->shift(), $extensions)->toOne();
+}
+
+// State-independent applicability predicate for ->typeName. AST shape only: 1 param,
+// either unrouted or wrapped only in NoSetRoutedValueSpecification. No State / vars
+// reads — required so this predicate can be evaluated at clustering time.
+function <<access.private>> meta::relational::functions::pureToSqlQuery::canProcessTypeName(f:FunctionExpression[1]):Boolean[1]
+{
+   // Can process 'typeName' in the context of semi structured mappings (which are not routed).
+   let params = $f.parametersValues->evaluateAndDeactivate();
+   ($params->size() == 1) && (!$params->at(0)->instanceOf(RoutedValueSpecification) || $params->at(0)->instanceOf(NoSetRoutedValueSpecification));
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::processTypeName(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   let processedLeftSide = processValueSpecificationReturnPropertyMapping($f.parametersValues->at(0), $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)->toOne();
+   let leftSideSWC = $processedLeftSide.element->cast(@SelectWithCursor);
+   let leftSideSelect = $leftSideSWC.select;
+   let propertyMappings = $processedLeftSide.currentPropertyMapping;
+
+   assert(($propertyMappings->size() >= 1) && $propertyMappings->forAll(pm | $pm->instanceOf(SemiStructuredRelationalPropertyMapping)),
+          | 'Expected semi structured property mappings. Got: ' + $propertyMappings->map(x | $x->genericType().rawType->toOne()->elementToPath())->joinStrings('[', ', ', ']'));
+
+   let typeNameBuilder = {r:RelationalOperationElement[*] |
+      assert($r->size() == 1, | 'Expected one relational operation element when processing \'typeName\'. Found: ' + $r->size()->toString());
+      // TODO: Hardcoding to @type. Schema/Binding information needs to be used
+      ^SemiStructuredPropertyAccess(operand = $r->toOne(), property = ^Literal(value = '@type'), returnType = String);
+   };
+
+   let newSelect = if ($state.inFilter,
+                       | ^$leftSideSelect(filteringOperation = $typeNameBuilder->eval($leftSideSelect.filteringOperation)),
+                       | ^$leftSideSelect(columns = $typeNameBuilder->eval($leftSideSelect.columns))
+                   );
+   $newSelect->validate($extensions);
+   ^$leftSideSWC
+   (
+      select = $newSelect
+   );
+}
+
+function meta::relational::functions::pureToSqlQuery::processNot(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   assert(!$f.parametersValues->at(0)->negatesRelationIn(),
+          | 'Negating in(value, Relation) is not supported on relational stores. Use not exists instead, for example replace !$d.departmentId->in($employees->select(~department)) with $d.departmentId->isEmpty() || !$employees->exists(e | $e.department == $d.departmentId)');
+
+   processUnary($f, $currentPropertyMapping, $operation, {a|^DynaFunction(name = 'not', parameters = $a)}, $vars, $state, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor)->moveExtraFilterToFilter($extensions);
+}
+
+// Only the boolean connectives are followed: an in() inside a lambda -- exists(r | $r.x->in($other)) under a
+// negation -- is not itself negated, so descending into one would reject a query that is perfectly expressible.
+function <<access.private>> meta::relational::functions::pureToSqlQuery::negatesRelationIn(v:ValueSpecification[1]):Boolean[1]
+{
+   $v->match([
+                f:SimpleFunctionExpression[1] | $f.func == meta::pure::functions::relation::in_U_$0_1$__Relation_1__Boolean_1_
+                                                  || ($f.func->in([meta::pure::functions::boolean::and_Boolean_1__Boolean_1__Boolean_1_,
+                                                                   meta::pure::functions::boolean::or_Boolean_1__Boolean_1__Boolean_1_,
+                                                                   meta::pure::functions::boolean::not_Boolean_1__Boolean_1_])
+                                                      && $f.parametersValues->exists(p | $p->negatesRelationIn())),
+                a:ValueSpecification[1] | false
+             ]);
+}
+
+function meta::relational::functions::pureToSqlQuery::processPlus(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   if ($f.parametersValues->size() == 1 && !$f.parametersValues->at(0)->instanceOf(InstanceValue),
+      |processAggregation($f, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions),
+      |processVariableArity($f, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+   );
+
+}
+
+function meta::relational::functions::pureToSqlQuery::processParseDate(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+    let formatInstance = ^InstanceValue(multiplicity = PureOne, genericType = ^GenericType(rawType=String), values = 'YYYY-MM-DD HH24:MI:SS');
+
+    processDynafuncWithRename('toTimestamp', ^$f(parametersValues=$f.parametersValues->concatenate($formatInstance)), $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+}
+
+//this is transformed to monthName due to "month" already handled as monthNumber in dialects
+function meta::relational::functions::pureToSqlQuery::processMonth(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+  processDynafuncWithRename('monthName', $f, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)
+}
+
+function meta::relational::functions::pureToSqlQuery::processFirstNotNull(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+  let caller = $state.functionExpressionStack->first();
+  let error = 'firstNotNull not supported outside of TDS context';
+
+  //we check that the caller function is in the tabular space
+  $caller->match([
+    s:SimpleFunctionExpression[1] | $s->evaluateAndDeactivate().func.classifierGenericType.typeArguments.rawType->match([
+      f:FunctionType[1] | $f.parameters->first()->evaluateAndDeactivate().genericType.rawType == TabularDataSet,
+      a:Any[*] | fail($error)
+    ]),
+    a:Any[*] | fail($error)
+  ]);
+
+  processDynafuncWithRename('coalesce', $f, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+}
+
+function meta::relational::functions::pureToSqlQuery::findAlias(columnName:String[1], columns:RelationalOperationElement[*]):Alias[0..1]
+{
+  let column = $columns->filter(c|$c->extractColumnName()->quoteSafeEqual($columnName));
+  if($column->isEmpty(),
+    |[],
+    |$column->toOne()->match([
+      a: Alias[1] | $a,
+      op: RelationalOperationElement[1] | ^Alias(name = $op->extractColumnName(), relationalElement = $op)
+    ])
+  );
+}
+
+function meta::relational::functions::pureToSqlQuery::processDynafuncWithRename(newName:String[1], f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+  let oldFunc = $f.func;
+  let newFunc = ^$oldFunc(functionName = $newName);
+  processDynaFunction(^$f(func = $newFunc), $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+}
+
+function meta::relational::functions::pureToSqlQuery::findAliasOrFail(columnName:String[1], select:SelectSQLQuery[1]):Alias[1]
+{
+   findAliasOrFail($columnName, $select.columns);
+}
+
+function meta::relational::functions::pureToSqlQuery::findAliasOrFail(columnName:String[1], columns:RelationalOperationElement[*]):Alias[1]
+{
+   let column = findAlias($columnName, $columns);
+   assertNotEmpty($column,{|'The column \''+$columnName+'\' can\'t be found ('+ $columns->map(c|$c->extractColumnName())->joinStrings(',')+')'});
+   $column->toOne();
+}
+
+function meta::relational::functions::pureToSqlQuery::findAliasOrFail(f:FunctionExpression[1], select:SelectSQLQuery[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1]):Alias[*]
+{
+   $f->instanceValuesAtParameter(1, $vars, $state.inScopeVars)->match([
+    s:String[*]|$s,
+    x:meta::pure::metamodel::relation::ColSpecArray<Any>[1]|$x.names,
+    v:meta::pure::metamodel::relation::ColSpec<Any>[1]|$v.name
+   ])->map(s| $s->findAliasOrFail($select));
+}
+
+function meta::relational::functions::pureToSqlQuery::processSortBy(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+  let leftSidePure = $f.parametersValues->at(0);
+  let leftSideOp = processValueSpecificationReturnPropertyMapping($leftSidePure, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)->toOne();
+  let mainQuery = $leftSideOp.element->cast(@SelectWithCursor);
+  let mainSelect = $mainQuery.select->pushSavedFilteringOperation($extensions);
+  let sortByFunc = $f.parametersValues->evaluateAndDeactivate()->at(1)->byPassRouterInfo()->cast(@InstanceValue).values->at(0);
+
+  $sortByFunc->match([
+    path: Path<Nil,Any|*>[1] |
+      let pathName = 'o_'+$path->buildColumnNameOutOfPath();
+      let joinResult = processPath($path, $pathName, '1', $mainQuery, $vars, ^$state(inFilter=false), $nodeId, $aggFromMap, $context->shift(), $extensions).element->cast(@SelectWithCursor).select;
+
+      let merge = $mainSelect->concatenate($joinResult)->mergeSQLQueryData($nodeId, $state, $context, $extensions);
+
+      ^$operation(
+          currentTreeNode = $mainQuery.currentTreeNode->toOne()->findOneNode($mainQuery.select.data->toOne(), $merge.data->toOne()),
+          positionBeforeLastApplyJoinTreeNode = if ($mainQuery.positionBeforeLastApplyJoinTreeNode->isEmpty(),|[],|$mainQuery.positionBeforeLastApplyJoinTreeNode->toOne()->findOneNode($mainQuery.select.data->toOne(), $merge.data->toOne())),
+          select = ^SelectSQLQuery(
+                      columns = $merge.columns,
+                      data = $merge.data,
+                      leftSideOfFilter = $merge.leftSideOfFilter,
+                      filteringOperation = $merge.filteringOperation,
+                      extraFilteringOperation = $merge.extraFilteringOperation,
+                      orderBy = ^OrderBy(column=$joinResult.columns->at(0)->cast(@Alias).relationalElement, direction= if($f.functionName == 'sortBy', |meta::relational::metamodel::SortDirection.ASC, |meta::relational::metamodel::SortDirection.DESC))
+                  )
+      );,
+    l: LambdaFunction<Any>[1] |
+      /*
+        - already have a mainQuery - select ...
+        - process the lambda function inside sortBy with the state to generate a sql query
+            select <sql_expr> as "generated_order_key" from ...
+          where <sql_expr> is a sql representation for lambda function and "generated_order_key" is a temporary alias introduced
+        - merge these two queries
+        - modify the merged query to move the sql_expr from select to order by
+            select ... order by <sql_expr>
+      */
+
+      let generated_order_key = '"generated_order_key"';
+      let paramValue = $f.parametersValues->at(1)->match([e:StoreMappingRoutedValueSpecification[1]|$e.value,v:ValueSpecification[1]|$v]);
+      let updatedState = $state->updateFunctionParamScope($paramValue.genericType.typeArguments.rawType->toOne()->cast(@FunctionType),$mainQuery);
+      let lambdaFunction = $f->instanceValuesAtParameter(1, $vars, $updatedState.inScopeVars)->at(0)->cast(@FunctionDefinition<Any>);
+      let lambdaFunctionExpression = $lambdaFunction.expressionSequence->at(0);
+      let inScopeVarsWithPlaceholdersState = $lambdaFunction->addPlaceHoldersForLambdaOpenVariables($vars, $updatedState);
+      let embeddedMapping = if($leftSideOp.currentPropertyMapping->isEmpty(), | $currentPropertyMapping, | $leftSideOp.currentPropertyMapping);
+
+      let mainSelect = $mainQuery.select;
+      let rightSide = processValueSpecification($lambdaFunctionExpression, $embeddedMapping, ^$mainQuery(select=^$mainSelect(columns=[])), $vars, ^$inScopeVarsWithPlaceholdersState(inFilter=false), JoinType.LEFT_OUTER, $nodeId, $aggFromMap, $context->shift(), $extensions)->toOne()->cast(@SelectWithCursor);
+
+      let rightSideSelect = $rightSide.select;
+      let rightSideModified = ^$rightSide(
+        select = ^$rightSideSelect(
+          columns = if($rightSideSelect.columns->isEmpty(), | [], |^Alias(name = $generated_order_key, relationalElement = $rightSideSelect.columns->toOne()))
+        )
+      );
+
+      let revisedLeftRightSelects = pair($mainSelect,$rightSideModified.select);
+      let merge = [$revisedLeftRightSelects.first, $revisedLeftRightSelects.second]->cast(@SelectSQLQuery)->mergeSQLQueryData($nodeId, $updatedState, $context, $extensions);
+      ^$operation(
+          currentTreeNode = $mainQuery.currentTreeNode->toOne()->findOneNode($mainQuery.select.data->toOne(), $merge.data->toOne()),
+          positionBeforeLastApplyJoinTreeNode = if ($mainQuery.positionBeforeLastApplyJoinTreeNode->isEmpty(),|[],|$mainQuery.positionBeforeLastApplyJoinTreeNode->toOne()->findOneNode($mainQuery.select.data->toOne(), $merge.data->toOne())),
+          select = ^SelectSQLQuery(
+                      columns = $merge.columns->filter(c|!$c->instanceOf(Alias) || $c->cast(@Alias).name != $generated_order_key),
+                      data = $merge.data,
+                      leftSideOfFilter = $merge.leftSideOfFilter,
+                      filteringOperation = $merge.filteringOperation,
+                      extraFilteringOperation = $merge.extraFilteringOperation,
+                      orderBy = ^OrderBy(column=$rightSideModified.select.columns->toOne()->cast(@Alias).name->findAliasOrFail($merge).relationalElement, direction=if($f.functionName == 'sortBy', |meta::relational::metamodel::SortDirection.ASC, |meta::relational::metamodel::SortDirection.DESC))
+                  )
+      );,
+    a: Any[1] | fail('Invalid parameter type to sortBy ' + $sortByFunc->type().name->orElse('unknown')); $operation;
+  ]);
+}
+
+function meta::relational::functions::pureToSqlQuery::processSlice(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   let mainQuery = processValueSpecification($f.parametersValues->at(0), $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)->toOne()->cast(@SelectWithCursor);
+   let mainSelect = $mainQuery.select;
+
+   let param1 = processValueSpecification($f.parametersValues->at(1), $currentPropertyMapping, $operation, $vars, $state, JoinType.LEFT_OUTER, $nodeId, $aggFromMap, $context, $extensions)->toOne()->cast(@SelectWithCursor).select.columns->at(0);
+   assert($param1->instanceOf(Literal),'Invalid type for first parameter inside the slice function. Expected a value, found operation/function');
+   let fromRow = $param1->cast(@Literal);
+   let param2 = processValueSpecification($f.parametersValues->at(2), $currentPropertyMapping, $operation, $vars, $state, JoinType.LEFT_OUTER, $nodeId, $aggFromMap, $context, $extensions)->toOne()->cast(@SelectWithCursor).select.columns->at(0);
+   assert($param2->instanceOf(Literal),'Invalid type for second parameter inside the slice function. Expected a value, found operation/function');
+   let toRow = $param2->cast(@Literal);
+   ^$mainSelect(fromRow = if($fromRow.value->instanceOf(Integer) && $fromRow.value->cast(@Integer) == 0, |[], |$fromRow),
+                toRow = $toRow
+   )->isolateSubSelectIfNotLastOperation($mainQuery, $f, $state.functionExpressionStack, $extensions);
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::isolateTdsSelect(query:SelectWithCursor[1], extensions:Extension[*]):SelectWithCursor[1]
+{
+  isolateTdsSelect($query.select, $query, $extensions);
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::isolateTdsSelect(select:SelectSQLQuery[1], query:SelectWithCursor[1], extensions:Extension[*]):SelectWithCursor[1]
+{
+  $select->isolateTdsSelect($query, 'subselect', $extensions);
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::isolateTdsSelect(select:SelectSQLQuery[1], query:SelectWithCursor[1], aliasName: String[1], extensions:Extension[*]):SelectWithCursor[1]
+{
+  let alias = ^TableAlias(name = $aliasName, relationalElement=$select->pushExtraFilteringOperation($extensions));
+  let newNode = ^RootJoinTreeNode(alias = $alias);
+  let columns = $alias->switchAliasForColumns($select.columns);
+
+  let newSelect = $select->match([
+    tds: TdsSelectSqlQuery[1] | ^TdsSelectSqlQuery(data = $newNode, columns = $columns, paths = $tds.paths),
+    sel: SelectSQLQuery[1] | ^SelectSQLQuery(data = $newNode, columns = $columns)
+  ]);
+
+  ^$query(select = $newSelect,
+          currentTreeNode = $query.currentTreeNode->map(ctn | $ctn->findNode($select.data->toOne(), $newNode)->orElse($newNode))
+  );
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::isolateSubSelectIfNotLastOperation(select:SelectSQLQuery[1], query:SelectWithCursor[1], f:FunctionExpression[1], parents:FunctionExpression[*], extensions:Extension[*]):SelectWithCursor[1]
+{
+   let p = $parents->evaluateAndDeactivate();
+   if ($p->size() > 1,
+    | let fe = $p->at($p->size()-2);
+      let ft = $fe.func->functionType();
+      if($ft.parameters->head().genericType->concatenate($ft.returnType)->forAll(x|
+      $x.rawType->toOne()->_subTypeOf(TabularDataSet) || $x.rawType->toOne()->_subTypeOf(meta::pure::metamodel::relation::Relation);),
+                  | isolateTdsSelect($select, $query, $extensions);,
+                  | ^$query(select=$select)
+      );,
+    | ^$query(select=$select)
+   );
+}
+
+function meta::relational::functions::pureToSqlQuery::processPaginated(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+  let preceedingFunction = $f.parametersValues->evaluateAndDeactivate()->at(0)->byPassRouterInfo()->cast(@FunctionExpression).func;
+  assert( $preceedingFunction == sortBy_T_m__Function_$0_1$__T_m_ || $preceedingFunction == sortByReversed_T_m__Function_$0_1$__T_m_|| $preceedingFunction == sort_TabularDataSet_1__SortInformation_MANY__TabularDataSet_1_, 'Paginated should be called on a sort or sortBy function');
+
+  let mainQuery = processValueSpecification($f.parametersValues->at(0), $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)->toOne()->cast(@SelectWithCursor);
+  let mainSelect = $mainQuery.select;
+  let param1 = processValueSpecification($f.parametersValues->at(1), $currentPropertyMapping, $operation, $vars, $state, JoinType.LEFT_OUTER, $nodeId, $aggFromMap, $context, $extensions)->toOne()->cast(@SelectWithCursor).select.columns->at(0);
+  assert($param1->instanceOf(Literal),'Invalid type for first parameter inside the paginated function. Expected an integer/integer variable, found operation/function');
+  let pageNumber = $param1->cast(@Literal);
+  let param2 = processValueSpecification($f.parametersValues->at(2), $currentPropertyMapping, $operation, $vars, $state, JoinType.LEFT_OUTER, $nodeId, $aggFromMap, $context, $extensions)->toOne()->cast(@SelectWithCursor).select.columns->at(0);
+  assert($param2->instanceOf(Literal),'Invalid type for second parameter inside the paginated function. Expected an integer/integer variable, found operation/function');
+  let pageSize = $param2->cast(@Literal);
+
+  let parents = $state.functionExpressionStack->evaluateAndDeactivate();
+  assert($parents->size() == 1 || ($parents->size() == 2 && $parents->at(0)->byPassRouterInfo()->cast(@FunctionExpression)->evaluateAndDeactivate().func->in(meta::pure::graphFetch::execution::graphFetchFunctions())), 'Paginated should either be last function in TDS query or called right before graphFetch');
+
+  let hasIntegerInputs = $pageNumber.value->instanceOf(Integer) && $pageSize.value->instanceOf(Integer);
+  let fromRow = if($hasIntegerInputs,
+    | ($pageNumber.value->cast(@Integer) - 1) * $pageSize.value->cast(@Integer),
+    | ^FreeMarkerOperationHolder(name = 'numberMultiply', parameters = [^FreeMarkerOperationHolder(name = 'numberSubtract', parameters = [$pageNumber, ^Literal(value='1')]), $pageSize])
+  );
+  let toRow = if($hasIntegerInputs,
+    | $pageNumber.value->cast(@Integer) * $pageSize.value->cast(@Integer),
+    | ^FreeMarkerOperationHolder(name = 'numberMultiply', parameters = [$pageNumber, $pageSize])
+  );
+  let processedSelect = ^$mainSelect(
+    fromRow = ^Literal(value = $fromRow),
+    toRow = ^Literal(value = $toRow)
+  );
+
+  ^$mainQuery(
+    select = $processedSelect,
+    currentTreeNode = if($mainQuery.currentTreeNode->isEmpty(),  | $mainQuery.currentTreeNode, | $mainQuery.currentTreeNode->toOne()->findOneNode($mainQuery.select.data->toOne(), $processedSelect.data->toOne()))
+  );
+}
+
+function meta::relational::functions::pureToSqlQuery::processTake(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   let mainQuery = processValueSpecification($f.parametersValues->at(0), $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)->toOne()->cast(@SelectWithCursor);
+   let param1 = processValueSpecification($f.parametersValues->at(1), $currentPropertyMapping, $operation, $vars, $state, JoinType.LEFT_OUTER, $nodeId, $aggFromMap, $context, $extensions)->toOne()->cast(@SelectWithCursor).select.columns->toOne();
+   assert($param1->instanceOf(Literal),'Invalid type for parameter inside the take/limit function. Expected a value, found operation/function');
+   let limitValue = $param1->cast(@Literal);
+   let mainSelect = $mainQuery.select;
+
+   let limitSize = if($limitValue->instanceOf(SQLNull),
+                      | [],
+                      | $limitValue//->cast(@Integer)
+                      );
+
+   isolateSubSelectIfNotLastOperation(^$mainSelect(toRow = $limitSize), $mainQuery, $f, $state.functionExpressionStack, $extensions);
+}
+
+function meta::relational::functions::pureToSqlQuery::processIf(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+  let returnType = $f.genericType.rawType->toOne();
+  processDynaFunction($f, $currentPropertyMapping, $operation, $vars, ^$state(inIf=true), $joinType, $nodeId, $aggFromMap, $context, $extensions);
+}
+
+function meta::relational::functions::pureToSqlQuery::processMultiIf(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+ let pairs = if($f.parametersValues->at(0)->instanceOf(InstanceValue), | $f.parametersValues->at(0)->cast(@InstanceValue).values, | $f.parametersValues->at(0));
+ assert($pairs->size() > 0, 'Multi-If pair cannot be empty');
+ let else = $f.parametersValues->at(1);
+
+ let res = $pairs->reverse()->fold(
+   {pair, acc |
+     let condSimpleExpression = $pair->cast(@SimpleFunctionExpression).parametersValues->cast(@InstanceValue).values->at(1)->cast(@KeyExpression).expression->byPassRouterInfo()
+     ->cast(@InstanceValue).values->cast(@LambdaFunction<Any>).expressionSequence;
+     let pairElse = $pair->cast(@SimpleFunctionExpression).parametersValues->cast(@InstanceValue).values->at(2)->cast(@KeyExpression).expression->byPassRouterInfo();
+
+     let ifElse = ^$f(
+       func = if_Boolean_1__Function_1__Function_1__T_m_,
+       functionName = 'if',
+       parametersValues = [
+         $condSimpleExpression->toOne(),
+         $pairElse->toOne(),
+         $acc
+       ]
+     )->evaluateAndDeactivate();
+     $ifElse;
+ },
+ $else);
+
+ processIf($res->cast(@FunctionExpression), $currentPropertyMapping, $operation, $vars, ^$state(inIf=true), $joinType, $nodeId, $aggFromMap, $context, $extensions);
+}
+
+function meta::relational::functions::pureToSqlQuery::processRelationAggColSpec(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   let newColumnName = $f.parametersValues->last()->cast(@InstanceValue).values->at(0)->extractName();
+   let topQuery = processValueSpecification($f.parametersValues->at(0), $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)->toOne()->cast(@SelectWithCursor);
+   processRelationWindowColumn(true, $f, [], [], [], $newColumnName, $f.parametersValues->at(1)->cast(@ValueSpecification)->reprocessVS()->reactivate($state.inScopeVars)->evaluateAndDeactivate()->toOne(),$currentPropertyMapping, $topQuery, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+}
+
+function meta::relational::functions::pureToSqlQuery::processRelationAggColSpecArray(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   let topQuery = processValueSpecification($f.parametersValues->at(0), $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)->toOne()->cast(@SelectWithCursor);
+   let aggColSpec = $f.parametersValues->at(1)->cast(@InstanceValue).values->at(0)->cast(@meta::pure::metamodel::relation::AggColSpecArray<Any,Any,Any>);
+   $aggColSpec.aggSpecs->fold({aggSpec,a|
+      let newColumnName = $aggSpec->extractName();
+      processRelationWindowColumn(true, $f, [], [], [], $newColumnName, $aggSpec, $currentPropertyMapping, $a, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor);
+   }, $topQuery);
+}
+
+function meta::relational::functions::pureToSqlQuery::processRelationWinAggColSpec(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   let window = $f.parametersValues->at(1)->cast(@InstanceValue).values->at(0)->cast(@meta::pure::functions::relation::_Window<Any>);
+   let partitionKeys = $window.partition;
+   let sortInfo = $window.sortInfo->map(s | ^SortInformation(column = $s.column.name, direction = if($s.direction == SortType.ASC, |meta::pure::tds::SortDirection.ASC,|meta::pure::tds::SortDirection.DESC)));
+   let frame = $window.frame;
+   let newColumnName = $f.parametersValues->last()->cast(@InstanceValue).values->at(0)->extractName();
+   let topQuery = processValueSpecification($f.parametersValues->at(0), $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)->toOne()->cast(@SelectWithCursor);
+   processRelationWindowColumn(true, $f,$partitionKeys,$sortInfo, $frame, $newColumnName, $f.parametersValues->at(2)->cast(@ValueSpecification)->reprocessVS()->reactivate($state.inScopeVars)->evaluateAndDeactivate()->toOne(), $currentPropertyMapping, $topQuery, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+}
+
+function meta::relational::functions::pureToSqlQuery::processRelationWinAggColSpecArray(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   let window = $f.parametersValues->at(1)->cast(@InstanceValue).values->at(0)->cast(@meta::pure::functions::relation::_Window<Any>);
+   let partitionKeys = $window.partition;
+   let sortInfo = $window.sortInfo->map(s | ^SortInformation(column = $s.column.name, direction = if($s.direction == SortType.ASC, |meta::pure::tds::SortDirection.ASC,|meta::pure::tds::SortDirection.DESC)));
+   let frame = $window.frame;
+   let aggColSpec = $f.parametersValues->at(2)->cast(@InstanceValue).values->at(0)->cast(@meta::pure::metamodel::relation::AggColSpecArray<Any,Any,Any>);
+   let topQuery = processValueSpecification($f.parametersValues->at(0), $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)->toOne()->cast(@SelectWithCursor);
+
+   $aggColSpec.aggSpecs->fold({aggSpec,a|
+      let newColumnName = $aggSpec->extractName();
+      processRelationWindowColumn(true, $f, $partitionKeys, $sortInfo, $frame, $newColumnName, $aggSpec, $currentPropertyMapping, $a, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor);
+   }, $topQuery);
+}
+
+function meta::relational::functions::pureToSqlQuery::processRelationWinFuncColSpec(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   let window = $f.parametersValues->at(1)->cast(@InstanceValue).values->at(0)->cast(@meta::pure::functions::relation::_Window<Any>);
+   let partitionKeys = $window.partition;
+   let sortInfo = $window.sortInfo->map(s | ^SortInformation(column = $s.column.name, direction = if($s.direction == SortType.ASC, |meta::pure::tds::SortDirection.ASC,|meta::pure::tds::SortDirection.DESC)));
+   let frame = $window.frame;
+   let newColumnName = $f.parametersValues->last()->cast(@InstanceValue).values->at(0)->extractName();
+   let topQuery = processValueSpecification($f.parametersValues->at(0), $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)->toOne()->cast(@SelectWithCursor);
+   processRelationWindowColumn(true, $f,$partitionKeys,$sortInfo, $frame, $newColumnName,$f.parametersValues->at(2)->cast(@ValueSpecification)->reprocessVS()->reactivate($state.inScopeVars)->evaluateAndDeactivate()->toOne(), $currentPropertyMapping, $topQuery, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+}
+
+function meta::relational::functions::pureToSqlQuery::processRelationWinFuncColSpecArray(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   let window = $f.parametersValues->at(1)->cast(@InstanceValue).values->at(0)->cast(@meta::pure::functions::relation::_Window<Any>);
+   let partitionKeys = $window.partition;
+   let sortInfo = $window.sortInfo->map(s | ^SortInformation(column = $s.column.name, direction = if($s.direction == SortType.ASC, |meta::pure::tds::SortDirection.ASC,|meta::pure::tds::SortDirection.DESC)));
+   let frame = $window.frame;
+   let funcColSpec = $f.parametersValues->at(2)->cast(@InstanceValue).values->at(0)->cast(@meta::pure::metamodel::relation::FuncColSpecArray<Any,Any>);
+   let topQuery = processValueSpecification($f.parametersValues->at(0), $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)->toOne()->cast(@SelectWithCursor);
+
+   $funcColSpec.funcSpecs->fold({funcSpec,a|
+      let newColumnName = $funcSpec->extractName();
+      processRelationWindowColumn(true, $f, $partitionKeys, $sortInfo, $frame, $newColumnName, $funcSpec, $currentPropertyMapping, $a, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor);
+   }, $topQuery);
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::processFrameValue(v: Number[1]):meta::relational::metamodel::FrameValue[1]
+{
+   if($v == 0,
+      | ^meta::relational::metamodel::FrameCurrentRowValue(),
+      | if ($v < 0,
+            | ^meta::relational::metamodel::FrameLiteralValue(value = ^Literal(value = $v->abs()), direction = meta::relational::metamodel::FrameValueDirection.PRECEDING),
+            | ^meta::relational::metamodel::FrameLiteralValue(value = ^Literal(value = $v->abs()), direction = meta::relational::metamodel::FrameValueDirection.FOLLOWING)));
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::processFrameIntervalValue(i: meta::pure::functions::relation::FrameIntervalValue[1]):meta::relational::metamodel::FrameValue[1]
+{
+   let v = $i.value;
+   if($v == 0,
+      | ^meta::relational::metamodel::FrameCurrentRowValue(),
+      | if ($v < 0,
+            | ^meta::relational::metamodel::FrameIntervalValue(value = ^Literal(value = $v->abs()), direction = meta::relational::metamodel::FrameValueDirection.PRECEDING, durationUnit = $i.durationUnit),
+            | ^meta::relational::metamodel::FrameIntervalValue(value = ^Literal(value = $v->abs()), direction = meta::relational::metamodel::FrameValueDirection.FOLLOWING, durationUnit = $i.durationUnit)));
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::processWindowFrame(frame: meta::pure::functions::relation::Frame[1]):meta::relational::metamodel::Frame[1]
+{
+   let frameType = $frame->match([
+                                   rows: meta::pure::functions::relation::Rows[1] | meta::relational::metamodel::FrameType.ROWS,
+                                   range: meta::pure::functions::relation::_Range[1] | meta::relational::metamodel::FrameType.RANGE,
+                                   rangeInterval: meta::pure::functions::relation::_RangeInterval[1] | meta::relational::metamodel::FrameType.RANGE
+                                 ]); 
+   let originalOffsetFrom = $frame.offsetFrom;
+   let originalOffsetTo = $frame.offsetTo;
+   assert(!(($originalOffsetFrom->instanceOf(meta::pure::functions::relation::FrameIntValue) &&
+          $originalOffsetTo->instanceOf(meta::pure::functions::relation::FrameIntValue) &&
+          ($originalOffsetFrom->cast(@meta::pure::functions::relation::FrameIntValue).value > $originalOffsetTo->cast(@meta::pure::functions::relation::FrameIntValue).value)) ||
+          ($originalOffsetFrom->instanceOf(meta::pure::functions::relation::FrameNumericValue) &&
+          $originalOffsetTo->instanceOf(meta::pure::functions::relation::FrameNumericValue) &&
+          ($originalOffsetFrom->cast(@meta::pure::functions::relation::FrameNumericValue).value > $originalOffsetTo->cast(@meta::pure::functions::relation::FrameNumericValue).value))),
+          | 'Invalid window frame boundary - lower bound of window frame cannot be greater than the upper bound!');
+   let offsetFrom = $originalOffsetFrom->match([
+                                                  i: meta::pure::functions::relation::FrameIntValue[1] | $i.value->processFrameValue(),
+                                                  n: meta::pure::functions::relation::FrameNumericValue[1] | $n.value->processFrameValue(),
+                                                  t: meta::pure::functions::relation::FrameIntervalValue[1] | $t->processFrameIntervalValue(),
+                                                  u: meta::pure::functions::relation::UnboundedFrameValue[1] | ^meta::relational::metamodel::UnboundedFrameValue(direction = meta::relational::metamodel::FrameValueDirection.PRECEDING)
+                                               ]);
+   let offsetTo = $originalOffsetTo->match([
+                                                  i: meta::pure::functions::relation::FrameIntValue[1] | $i.value->processFrameValue(),
+                                                  n: meta::pure::functions::relation::FrameNumericValue[1] | $n.value->processFrameValue(),
+                                                  t: meta::pure::functions::relation::FrameIntervalValue[1] | $t->processFrameIntervalValue(),
+                                                  u: meta::pure::functions::relation::UnboundedFrameValue[1] | ^meta::relational::metamodel::UnboundedFrameValue(direction = meta::relational::metamodel::FrameValueDirection.FOLLOWING)
+                                           ]);
+   ^meta::relational::metamodel::Frame(offsetFrom = $offsetFrom, offsetTo = $offsetTo, frameType = $frameType);
+}
+
+function meta::relational::functions::pureToSqlQuery::processRelationWindowColumn(
+          newFlow:Boolean[1],
+          f:FunctionExpression[1],
+          partitionKeys:String[*],
+          sortInfo:SortInformation[*],
+          frame:meta::pure::functions::relation::Frame[0..1],
+          name : String[1],
+          aggSpec: Any[1],
+          currentPropertyMapping:PropertyMapping[*], topQuery:SelectWithCursor[1], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   let newColumnName = $name;
+
+   let selectQuery = $topQuery.select->cast(@TdsSelectSqlQuery);
+
+   let shouldIsolateDistinct = $selectQuery.distinct->orElse(false);
+
+   let mainQuery = if($shouldIsolateDistinct, |$selectQuery->isolateTdsSelect($topQuery, $extensions), |$topQuery)->cast(@SelectWithCursor);
+   let mainSelect = $mainQuery.select->cast(@TdsSelectSqlQuery);
+
+   assert(!$mainSelect.columns->map(col | $col->extractColumnName())->contains($newColumnName), | 'Attempting to reuse the same column name: '+ $newColumnName);
+
+   let windowElement = $partitionKeys->map(columnName|findAliasOrFail($columnName, $mainSelect).relationalElement);
+   let sortElements = $sortInfo->map(si|^SortByInfo(sortByElement=findAliasOrFail($si.column, $mainSelect).relationalElement, 
+                                                    sortDirection = if($si.direction.name == meta::pure::tds::SortDirection.DESC.name,| meta::relational::metamodel::SortDirection.DESC,| meta::relational::metamodel::SortDirection.ASC)));
+   let newFrame = if($frame->isEmpty(), | [], | $frame->toOne()->processWindowFrame());
+   let window = ^meta::relational::metamodel::WindowColumn(
+      columnName = $newColumnName,
+      func=^DynaFunction(name='PLACEHOLDER'),
+      window = ^meta::relational::metamodel::Window(partition=$windowElement, sortBy=$sortElements, frame=$newFrame)
+   );
+
+   let func = $aggSpec->match(
+      [
+        a:meta::pure::metamodel::relation::AggColSpec<Any,Any,Any>[1] | let aggContainer = ^AggContainer(name=$a.name,map=$a.map,reduce=$a.reduce);
+                                                                        processRelationMapReduce($aggContainer, true, '', $currentPropertyMapping, $mainQuery, $vars, ^$state(currentWindow=if($newFlow,|$window,|[])), $joinType, $nodeId, $aggFromMap, $context, $extensions);,
+        func : meta::pure::metamodel::relation::FuncColSpec<Any,Any>[1] | let aggContainer = ^AggContainer(name=$func.name,map=$func.function);
+                                                                          processRelationMap($aggContainer, true, '', $currentPropertyMapping, $mainQuery, $vars, ^$state(currentWindow=if($newFlow,|$window,|[])), $joinType, $nodeId, $aggFromMap, $context, $extensions)->toOne();
+      ]
+   );
+
+   let windowColumn = ^Alias
+                      (
+                        name=$newColumnName->addQuotesIfNecessary(),
+                        relationalElement = if ($newFlow,|$func,|^$window(func=$func->cast(@DynaFunction)))
+                      );
+
+   // Return Type
+   let pureType = $aggSpec->match(
+                                [
+                                  t:TdsOlapAggregation<Any>[1]|$t.func->functionReturnType(),
+                                  r:TdsOlapRank<Any>[1]|^GenericType(rawType=Integer),
+                                  z:meta::pure::metamodel::relation::FuncColSpec<Any,Any>[1]|$z.function->functionReturnType(),
+                                  o:meta::pure::metamodel::relation::AggColSpec<Any,Any,Any>[1]|$o.reduce->functionReturnType()
+                                ]
+                              );
+   let newPath = pair($newColumnName, ^PathInformation(type=$pureType.rawType->toOne(), relationalType= meta::relational::transform::fromPure::pureTypeToDataType($pureType)));
+
+   if ($f->cast(@SimpleFunctionExpression).func == meta::pure::functions::relation::extend_Relation_1___Window_1__AggColSpec_1__Relation_1_,
+    | ^$operation(select = ^$mainSelect(columns = $mainSelect.columns->concatenate($windowColumn), paths +=$newPath)),
+    | ^$mainSelect(columns = $mainSelect.columns->concatenate($windowColumn), paths +=$newPath)->isolateSubSelectIfNotLastOperation($operation, $f, $state.functionExpressionStack, $extensions);
+  );
+}
+
+function meta::relational::functions::pureToSqlQuery::extractName(o:Any[0..1]):String[1]
+{
+   let newColumnName = $o->match([
+     str : String[1] | $str,
+     agg : meta::pure::metamodel::relation::AggColSpec<Any,Any,Any>[1] | $agg.name,
+     func : meta::pure::metamodel::relation::FuncColSpec<Any,Any>[1] | $func.name
+   ]);
+}
+
+function meta::relational::functions::pureToSqlQuery::processTdsFilter(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   let mainQuery = processValueSpecification($f.parametersValues->at(0), $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)->toOne()->cast(@SelectWithCursor);
+
+   let mainSelect = $mainQuery.select;
+
+   if($state.insertDriverTablePkInTempTable->isNotEmpty(),
+      | $mainQuery->cast(@SelectWithCursor),
+      | let filterCursor = ^$mainQuery(select=^$mainSelect(filteringOperation=[], extraFilteringOperation=[]));
+        let res = processValueSpecification($f.parametersValues->at(1), [], $filterCursor, $vars, ^$state(inFilter=true)->withRelationVarScope($f.parametersValues->at(1), $filterCursor), $joinType, $nodeId, $aggFromMap, $context, $extensions)->toOne()->cast(@SelectWithCursor);
+        let select = $res.select;
+        let mainQueryFilter=$mainSelect.filteringOperation->concatenate($mainQuery.select.extraFilteringOperation)->andFilters($extensions);
+        let mainQueryColumns = $mainSelect.columns;
+
+        let finalColumns = $mainQueryColumns->map(c|
+                                                  $c->match(
+                                                     [
+                                                        w:WindowColumn[1]|if(!$select.columns->extractTableAliasColumns().column.name->contains($w.columnName) ,|$w,|$select.columns->filter(c|$c->extractTableAliasColumns().column.name==$w.columnName)->toOne()),
+                                                        a:Alias[1]| let col = $select.columns->filter(c|$c->instanceOf(Alias) && $c->cast(@Alias).name==$a.name);
+                                                                    $col->isEmpty()->if(|$a,|$col);,
+                                                        r:RelationalOperationElement[1]| $r
+                                                     ]
+                                                  ));
+        let queryRootMutated = !$mainSelect->rootIsSubQuery() && $select->rootIsSubQuery();
+        let placeNestedFilters = {select:SelectSQLQuery[1]|let havingFilter=$select.data->toOne().alias.relationalElement->cast(@SelectSQLQuery).filteringOperation;
+                                                           let filter = $havingFilter->concatenate($mainSelect.havingOperation)->andFilters($extensions);
+                                                           let newSelect = nestFilters($select,$mainQueryFilter,$filter);
+                                                           ^$newSelect(columns=$finalColumns, filteringOperation=$select.filteringOperation);
+                                 };
+        let placeRootFilters = {select: SelectSQLQuery[1]|let filteringOperation = $select.filteringOperation;
+                                                          let filter = $filteringOperation->concatenate($mainSelect.havingOperation)->concatenate($mainSelect.qualifyOperation)->andFilters($extensions);
+                                                          if ($filteringOperation->getWindowColsFromOperation()->isEmpty(),
+                                                            | ^$select(columns=$finalColumns, filteringOperation=$mainQueryFilter, havingOperation=$filter),
+                                                            | ^$select(columns=$finalColumns, filteringOperation=$mainQueryFilter, qualifyOperation=$filter)
+                                                          );
+                                };
+        let nestMainFilter = {select: SelectSQLQuery[1]|let newSelect = nestFilters($select,$mainQueryFilter,[]);
+                                                        ^$newSelect(columns=$finalColumns, filteringOperation=$select.filteringOperation->concatenate($newSelect.filteringOperation)->andFilters($extensions));
+                              };
+        let placeMainFilterAtRoot ={select: SelectSQLQuery[1] | let filter = $select.filteringOperation->concatenate($mainQueryFilter)->andFilters($extensions);
+                                                                ^$select(columns=$finalColumns, filteringOperation=$filter);
+                                   };
+
+        if($queryRootMutated,| let updatedSelect = if(!$mainSelect.groupBy->isEmpty() || !$mainSelect.pivot->isEmpty(),
+                                                    | $placeNestedFilters->eval($select),
+                                                    | $nestMainFilter->eval($select));
+                               ^$res(select = $updatedSelect);
+
+                            ,| let updatedSelect = if(!$mainSelect.groupBy->isEmpty() || !$mainSelect.pivot->isEmpty() || !$select.filteringOperation->getWindowColsFromOperation()->isEmpty(),
+                                                    | $placeRootFilters->eval($select),
+                                                    | $placeMainFilterAtRoot->eval($select));
+
+                               ^$res(select = $updatedSelect,
+                                     currentTreeNode = if($mainQuery.currentTreeNode->isNotEmpty(),| $mainQuery.currentTreeNode->toOne()->findOneNode($mainSelect.data->toOne(), $res.select.data->toOne()), |[]),
+                                     positionBeforeLastApplyJoinTreeNode = if($mainQuery.positionBeforeLastApplyJoinTreeNode->isNotEmpty(),| $mainQuery.positionBeforeLastApplyJoinTreeNode->toOne()->findOneNode($mainSelect.data->toOne(), $res.select.data->toOne()), |[]));
+
+           );
+   );
+}
+
+function meta::relational::functions::pureToSqlQuery::rootIsSubQuery(query: SelectSQLQuery[1]): Boolean[1]
+{
+   $query.data->toOne().alias.relationalElement->instanceOf(SelectSQLQuery)
+}
+
+function meta::relational::functions::pureToSqlQuery::nestFilters(newQuery:SelectSQLQuery[1], filters:RelationalOperationElement[0..1],having:RelationalOperationElement[0..1]):SelectSQLQuery[1]
+{
+   let data = $newQuery.data->toOne()->cast(@RootJoinTreeNode);
+   let alias = $data.alias;
+   let nestedSelect = $alias.relationalElement->cast(if($alias.relationalElement->instanceOf(TdsSelectSqlQuery),|@TdsSelectSqlQuery,|@SelectSQLQuery));
+   let oldToNew = ^OldAliasToNewAlias(first = $alias.name, second = $nestedSelect.data->cast(@RootJoinTreeNode)->toOne().alias);
+   let newFilters = $filters->reprocessAliases($oldToNew);
+   let newHaving = $having->reprocessAliases($oldToNew);
+   ^$newQuery(data = ^$data(alias = ^$alias(relationalElement =^$nestedSelect(filteringOperation = $newFilters, havingOperation = $newHaving))));
+}
+
+function meta::relational::functions::pureToSqlQuery::getWindowColsFromOperation(operation: RelationalOperationElement[*]): WindowColumn[*]
+{
+  if($operation->isNotEmpty() && $operation->toOne()->instanceOf(DynaFunction),
+    | $operation->cast(@DynaFunction).parameters->map(o|$o->match([
+                                                                    d:DynaFunction[1] | $d->getWindowColsFromOperation(),
+                                                                    w:WindowColumn[1] | $w,
+                                                                    a:Any[*] | []
+                                                                  ])
+                                                     ),
+    | []
+  );
+}
+
+function meta::relational::functions::pureToSqlQuery::addPkForAggregation(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], existingQuery:SelectWithCursor[1], state:State[1], nodeId:String[1], context:DebugContext[1], extensions:Extension[*]):SelectWithCursor[1]
+{
+   // Add PK
+   if (!$f.parametersValues->at(0)->instanceOf(StoreMappingRoutedValueSpecification) || !$f.parametersValues->at(0)->cast(@StoreMappingRoutedValueSpecification).sets->size() == 1,
+         |$existingQuery,
+         |if($f.parametersValues->at(0)->cast(@StoreMappingRoutedValueSpecification).sets->toOne()->instanceOf(RootRelationalInstanceSetImplementation),
+             |let rs = $f.parametersValues->at(0)->cast(@StoreMappingRoutedValueSpecification).sets->toOne()->cast(@RootRelationalInstanceSetImplementation);
+              let pk = $rs->resolvePrimaryKey();
+              let valid = if ($pk->isEmpty(), | fail('There is no primary key defined on the table ' + $rs->mainTable()->toOne().name + '. A primary key must be defined in the table definition in PURE to use this feature'); false; ,| true);
+              let existingSelect = $existingQuery.select;
+              let all = $pk->filter(p|$p->instanceOf(TableAliasColumn))->map(p|$p->processColumnsInRelationalOperationElements(^$state(inFilter=false), ^$existingQuery(select=^$existingSelect(leftSideOfFilter=[]), positionBeforeLastApplyJoinTreeNode=[]), $nodeId, ^List<ColumnGroup>(), false, $context, $extensions));
+              let sel = $all->map(c|$c.select)->cast(@SelectSQLQuery)->mergeSQLQueryData($nodeId, $state, $context, $extensions);
+              let mergedWithCollapsedFilteringOperation = ^$sel(filteringOperation = $sel.filteringOperation->tail()->fold({f,a|[$a->toOne(),$f]->andFilters($extensions)}, $sel.filteringOperation->head()));
+              let res = $all->first()->toOne();
+              let result = ^$res
+                           (
+                              select = ^$mergedWithCollapsedFilteringOperation
+                                       (
+                                          leftSideOfFilter = if($existingQuery.select.leftSideOfFilter->isEmpty(),|[],|$existingQuery.select.leftSideOfFilter->toOne()->findNode($existingQuery.select.data->toOne(), $mergedWithCollapsedFilteringOperation.data->toOne())->toOne())
+                                       ),
+                              currentTreeNode = $res.currentTreeNode->toOne()->findOneNode($res.select.data->toOne(), $mergedWithCollapsedFilteringOperation.data->toOne()),
+                              positionBeforeLastApplyJoinTreeNode = if($existingQuery.positionBeforeLastApplyJoinTreeNode->isEmpty(),|[],|$existingQuery.positionBeforeLastApplyJoinTreeNode->toOne()->findNode($existingQuery.select.data->toOne(), $mergedWithCollapsedFilteringOperation.data->toOne())->toOne())
+                           );
+              $result->validate([], $extensions);
+              $result;,
+             |if($f.parametersValues->at(0)->cast(@StoreMappingRoutedValueSpecification).sets->toOne()->instanceOf(RelationFunctionInstanceSetImplementation),
+                 |let rs = $f.parametersValues->at(0)->cast(@StoreMappingRoutedValueSpecification).sets->toOne()->cast(@RelationFunctionInstanceSetImplementation)->meta::relational::mapping::ensureRelationFunctionPrimaryKeyResolved($extensions);
+                  let pk = $rs->meta::relational::mapping::getRelationFunctionPkAsTableAliasColumns();
+                  // No PK available — skip PK injection; addSelfJoin will assert downstream if needed.
+                  if($pk->isEmpty(),
+                     |$existingQuery,
+                     |let existingSelect = $existingQuery.select;
+                      // Ensure currentTreeNode is set (processRelationFunctionClassMapping may leave it empty).
+                      let queryWithTreeNode = if($existingQuery.currentTreeNode->isEmpty(),
+                                                  | ^$existingQuery(currentTreeNode = $existingQuery.select.data),
+                                                  | $existingQuery);
+                      let all = $pk->map(p|$p->processColumnsInRelationalOperationElements(^$state(inFilter=false), ^$queryWithTreeNode(select=^$existingSelect(leftSideOfFilter=[]), positionBeforeLastApplyJoinTreeNode=[]), $nodeId, ^List<ColumnGroup>(), false, $context, $extensions));
+                      let sel = $all->map(c|$c.select)->cast(@SelectSQLQuery)->mergeSQLQueryData($nodeId, $state, $context, $extensions);
+                      let mergedWithCollapsedFilteringOperation = ^$sel(filteringOperation = $sel.filteringOperation->tail()->fold({f,a|[$a->toOne(),$f]->andFilters($extensions)}, $sel.filteringOperation->head()));
+                      let res = $all->first()->toOne();
+                      let result = ^$res
+                                   (
+                                      select = ^$mergedWithCollapsedFilteringOperation
+                                               (
+                                                  leftSideOfFilter = if($existingQuery.select.leftSideOfFilter->isEmpty(),|[],|$existingQuery.select.leftSideOfFilter->toOne()->findNode($existingQuery.select.data->toOne(), $mergedWithCollapsedFilteringOperation.data->toOne())->toOne())
+                                               ),
+                                      currentTreeNode = $res.currentTreeNode->toOne()->findOneNode($res.select.data->toOne(), $mergedWithCollapsedFilteringOperation.data->toOne()),
+                                      positionBeforeLastApplyJoinTreeNode = if($existingQuery.positionBeforeLastApplyJoinTreeNode->isEmpty(),|[],|$existingQuery.positionBeforeLastApplyJoinTreeNode->toOne()->findNode($existingQuery.select.data->toOne(), $mergedWithCollapsedFilteringOperation.data->toOne())->toOne())
+                                   );
+                      $result->validate([], $extensions);
+                      $result;
+                  );,
+                 |if($f.parametersValues->at(0)->cast(@StoreMappingRoutedValueSpecification).sets->toOne()->instanceOf(OperationSetImplementation) && ($f.parametersValues->at(0)->cast(@StoreMappingRoutedValueSpecification).sets->toOne()->cast(@OperationSetImplementation)->resolveOperation($state.mapping->toOne())->size() > 1) && $f.parametersValues->at(0)->cast(@StoreMappingRoutedValueSpecification).sets->toOne()->cast(@OperationSetImplementation)->resolveOperation($state.mapping->toOne())->forAll(set | $set->instanceOf(RootRelationalInstanceSetImplementation)) && $existingQuery.currentTreeNode->isNotEmpty() && $existingQuery.currentTreeNode->toOne().alias.relationalElement->instanceOf(Union),
+                     |addPkForAggregationInUnion($existingQuery, $f.parametersValues->at(0)->cast(@StoreMappingRoutedValueSpecification).sets->toOne()->cast(@OperationSetImplementation)->resolveOperation($state.mapping->toOne())->cast(@RootRelationalInstanceSetImplementation), $state, $extensions),
+                     |$existingQuery
+                  );
+              );
+          );
+
+   );
+
+}
+
+function meta::relational::functions::pureToSqlQuery::buildNodeId(startNode:String[1], preToAdd:String[1]):String[1]
+{
+   let toAdd = if($preToAdd == '_i0',|'_d',|$preToAdd);
+   let res = if ($startNode == '',
+      |$toAdd,
+      |let lastIndexParsed = $startNode->lastIndexOf('#');
+       let existingNumber = if($lastIndexParsed == -1,
+                                 | // No #
+                                   pair(1, $startNode->length());,
+                                 | let number = $startNode->substring($lastIndexParsed+1,$startNode->length());
+                                   if ($number->indexOf('_') == -1,
+                                      |// Extract the value from the #
+                                       pair($number->parseInteger(), $lastIndexParsed),
+                                      |// We have a # but it's not terminal
+                                       pair(1, $startNode->length())
+                                   );
+                            );
+       let lastIndex = $existingNumber.second;
+       let lastUnder = $startNode->lastIndexOf('_');
+       let lastPattern = $startNode->substring($lastUnder, $lastIndex);
+       if ($toAdd == $lastPattern,
+          |let number = $existingNumber.first+1;
+           $startNode->substring(0, $lastIndex)+'#'+$number->toString();,
+          |$startNode+$toAdd;
+       );
+   );
+   $res;
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::isAggregationFunction(f:meta::pure::metamodel::function::Function<Any>[1], supported:Map<meta::pure::metamodel::function::Function<Any>,meta::pure::metamodel::function::Function<{FunctionExpression[1], PropertyMapping[0..1], SelectWithCursor[1], Map<VariableExpression, ValueSpecification>[1], State[1], JoinType[1], String[1], List<ColumnGroup>[1], DebugContext[1], Extension[*]->RelationalOperationElement[1]}>>[1]):Boolean[1]
+{
+   let mFunc = $supported->get($f);
+   $mFunc->in([meta::relational::functions::pureToSqlQuery::processAggregation_FunctionExpression_1__PropertyMapping_MANY__SelectWithCursor_1__Map_1__State_1__JoinType_1__String_1__List_1__DebugContext_1__Extension_MANY__RelationalOperationElement_1_,
+               meta::relational::functions::pureToSqlQuery::processStringPlus_FunctionExpression_1__PropertyMapping_MANY__SelectWithCursor_1__Map_1__State_1__JoinType_1__String_1__List_1__DebugContext_1__Extension_MANY__RelationalOperationElement_1_,
+               meta::relational::functions::pureToSqlQuery::processPlus_FunctionExpression_1__PropertyMapping_MANY__SelectWithCursor_1__Map_1__State_1__JoinType_1__String_1__List_1__DebugContext_1__Extension_MANY__RelationalOperationElement_1_,
+               meta::relational::functions::pureToSqlQuery::processJoinStrings_FunctionExpression_1__PropertyMapping_MANY__SelectWithCursor_1__Map_1__State_1__JoinType_1__String_1__List_1__DebugContext_1__Extension_MANY__RelationalOperationElement_1_
+   ]);
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::containsAggregationFunctionInValueSpecification(f:ValueSpecification[1], supported:Map<meta::pure::metamodel::function::Function<Any>,meta::pure::metamodel::function::Function<{FunctionExpression[1], PropertyMapping[0..1], SelectWithCursor[1], Map<VariableExpression, ValueSpecification>[1], State[1], JoinType[1], String[1], List<ColumnGroup>[1], DebugContext[1], Extension[*]->RelationalOperationElement[1]}>>[1]):Boolean[1]
+{
+   $f->match([
+                  e:StoreMappingRoutedValueSpecification[1]|$e.value,
+                  a:Any[*]|$a
+                ])
+     ->match([
+               f:FunctionExpression[1]| if ($f.func->isAggregationFunction($supported),
+                                            |true,
+                                            |$f.func->match([
+                                                  f:FunctionDefinition<Any>[1]|$f->containsAggregationFunctionInFunction($supported),
+                                                  a:Any[*]|false
+                                                 ]) ||
+                                             $f.parametersValues->evaluateAndDeactivate()->fold({a,b|$b || $a->containsAggregationFunctionInValueSpecification($supported)},false);
+                                        );,
+               i:InstanceValue[1]|$i.values->fold({a,b|$b || $a->match([f:FunctionDefinition<Any>[1]|$f->containsAggregationFunctionInFunction($supported),
+                                                                        vs:ValueSpecification[1]|$vs->containsAggregationFunctionInValueSpecification($supported),
+                                                                        a:Any[1]|false])},false),
+               a:Any[1]|false
+             ]
+          );
+}
+
+function meta::relational::functions::pureToSqlQuery::containsAggregationFunctionInFunction(f:meta::pure::metamodel::function::Function<Any>[1], supported:Map<meta::pure::metamodel::function::Function<Any>,meta::pure::metamodel::function::Function<{FunctionExpression[1], PropertyMapping[0..1], SelectWithCursor[1], Map<VariableExpression, ValueSpecification>[1], State[1], JoinType[1], String[1], List<ColumnGroup>[1], DebugContext[1], Extension[*]->RelationalOperationElement[1]}>>[1]):Boolean[1]
+{
+   $f->match([f:FunctionDefinition<Any>[1]|$f.expressionSequence->at(0)->evaluateAndDeactivate()->containsAggregationFunctionInValueSpecification($supported),a:Any[1]|false]);
+}
+
+function meta::relational::functions::pureToSqlQuery::processMap(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):OperationWithParentPropertyMapping[1]
+{
+  let windowFns = [first_Relation_1___Window_1__T_1__T_$0_1$_, offset_Relation_1__T_1__Integer_1__T_$0_1$_, last_Relation_1___Window_1__T_1__T_$0_1$_, nth_Relation_1___Window_1__T_1__Integer_1__T_$0_1$_];
+  if($f.parametersValues->at(0)->instanceOf(FunctionExpression) && $windowFns->contains($f.parametersValues->at(0)->cast(@FunctionExpression).func),
+    | let newState = ^$state(colName = $f->meta::pure::functions::meta::removeAutomap()->cast(@FunctionExpression)->evaluateAndDeactivate().func.name, aliasName='subselect');
+      processValueSpecificationReturnPropertyMapping($f.parametersValues->at(0), $currentPropertyMapping, $operation, $vars, $newState, $joinType, buildNodeId($nodeId,'_d'), $aggFromMap, $context, $extensions);,
+
+    | let res = processValueSpecificationReturnPropertyMapping($f.parametersValues->at(0), $currentPropertyMapping, $operation, $vars, $state, $joinType, buildNodeId($nodeId,'_d'), $aggFromMap, $context, $extensions);
+      let mainQuery = $res.element->toOne()->cast(@SelectWithCursor)->manageIsolation([], $nodeId, false, $state, $context, $extensions);//$res.element->toOne()->cast(@SelectWithCursor);
+      let select = $mainQuery.select;
+      let mainQueryWithColumns = ^$mainQuery(select = ^$select(columns=[]));
+
+      let newCurrentPropertyMapping = if ($res.currentPropertyMapping->isEmpty(), | [], | $res.currentPropertyMapping);
+
+      let func = $f->instanceValuesAtParameter(1, $vars, $state.inScopeVars)->match([
+                      e:StoreMappingRoutedValueSpecification[1]|$e.value->reactivate();,
+                      a:Any[*]|$a
+                    ]);
+
+      let newQuery = if($func->cast(@meta::pure::metamodel::function::Function<Any>)->toOne()->containsAggregationFunctionInFunction($state.supportedFunctions),
+                        |addPkForAggregation($f, $newCurrentPropertyMapping, $mainQueryWithColumns, $state, $nodeId, $context, $extensions),
+                        |$mainQueryWithColumns
+                      );
+      let newSelect = $newQuery.select;
+
+      let milestoningContext=$newQuery.milestoningContext->concatenate($operation.milestoningContext)->first();
+
+      let isSemiStructuredPropertyMapping = ($newCurrentPropertyMapping->size() >= 1) && $newCurrentPropertyMapping->forAll(pm | $pm->instanceOf(SemiStructuredRelationalPropertyMapping));
+      let isVariant = $f.parametersValues->at(0)->isVariantInput($vars, $state);
+      let extraColumn = if(($isSemiStructuredPropertyMapping || $isVariant) && ($select.columns->size() == 1),
+                            | $select.columns->toOne()->reprocessAliases($mainQuery.currentTreeNode.alias.name->map(n | ^OldAliasToNewAlias(first = $n, second = $newQuery.currentTreeNode.alias->toOne()))),
+                            | []);
+
+      $func->match(
+                    [
+                      p:Property<Nil,Any|*>[1]|processProperty($p, $f.parametersValues->at(0)->byPassRouterInfo()->cast(@ValueSpecification).genericType.rawType->toOne()->cast(@Class<Any>), $newCurrentPropertyMapping, $state.propertyMappingFromRouter, ^$newQuery(select=^$newSelect(columns=[])), $state, $joinType, buildNodeId($nodeId,'_d'), ^$aggFromMap(values+=^ColumnGroup(columns=$newSelect.columns)), $context->shift(), $extensions),
+                      q:QualifiedProperty<Any>[1]|processQualifiedProperty($q, $newCurrentPropertyMapping, ^$newQuery(select=^$newSelect(columns=[])), $vars, ^$state(qualifierBase=$res->toOne()), $joinType, buildNodeId($nodeId,'_q'), ^$aggFromMap(values+=^ColumnGroup(columns=$newSelect.columns)), $context->shift(), $extensions)->toOne(),
+                      f:FunctionDefinition<Any>[1]| let sourceOp = ^$newQuery(select=^$newSelect(columns=[]->concatenate($extraColumn)), milestoningContext=$milestoningContext);
+                                                    let stateUpdatedWithInputQuery = $state->updateFunctionParamScope($f.classifierGenericType.typeArguments.rawType->toOne()->cast(@FunctionType),$sourceOp);
+                                                    let inScopeVarsWithPlaceholdersState = $f->addPlaceHoldersForLambdaOpenVariables($vars, $stateUpdatedWithInputQuery);
+                                                    processValueSpecificationReturnPropertyMapping($f.expressionSequence->at(0), $newCurrentPropertyMapping, $sourceOp, $vars, $inScopeVarsWithPlaceholdersState, $joinType, buildNodeId($nodeId,'_f'), ^$aggFromMap(values+=^ColumnGroup(columns=$newSelect.columns)), $context->shift(), $extensions)->toOne();,
+                      pa:Path<Nil,Any|*>[1] | let res = processPath($pa, 'map', '_map', $newQuery, $vars, $state, $nodeId, $aggFromMap, $context->shift(), $extensions);
+                                              if($state.inFilter || $res.element->cast(@SelectWithCursor).select.columns->isEmpty(), | $res, | let selectWithCursor = $res.element->cast(@SelectWithCursor);
+                                                                      let select = $selectWithCursor.select;
+                                                                      let newColumn = $select.columns->toOne()->cast(@Alias).relationalElement;
+                                                                      ^$res(element=^$selectWithCursor(select=^$select(columns=$newColumn)));
+                                                                      );
+                    ]);
+   )->toOne();
+}
+
+// State-independent applicability predicate for `new(Class, name, [KeyExpression])`.
+// Returns true iff the constructed Class is Pair (the only Class new() the relational
+// store knows how to translate, used by processTo / processToMany / processNewPair).
+// No State / vars reads — the narrower fe-only signature lets this be evaluated at
+// clustering time and keeps the type system from accidentally introducing State reads.
+function meta::relational::functions::pureToSqlQuery::isNewPairFunction(f: FunctionExpression[1]): Boolean[1]
+{
+  $f.parametersValues->at(0).genericType.typeArguments.rawType == Pair;
+}
+
+function meta::relational::functions::pureToSqlQuery::processNewPair(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   let keyExpressions = $f.parametersValues->evaluateAndDeactivate()->drop(2)->cast(@InstanceValue).values->cast(@KeyExpression)->sortBy(x | $x.key->reactivate()->cast(@String)->toOne()); // pair has 2 properties, "first" and "second"... alphabetically "first" goes before "second"...
+
+   let roes = $keyExpressions->map(ke |
+    $ke.expression->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)->toOne()->cast(@SelectWithCursor).select.columns;
+   );
+
+   let tuple = newDynaFunction('pair', $roes);
+
+   let select = $operation.select;
+   ^$operation(select = $state.inFilter->if(|^$select(filteringOperation = $tuple),|^$select(columns = $tuple)));
+}
+
+function meta::relational::functions::pureToSqlQuery::processDrop(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   let mainQuery = processValueSpecification($f.parametersValues->at(0), $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)->toOne()->cast(@SelectWithCursor);
+   let mainSelect = $mainQuery.select;
+
+   let param1 = processValueSpecification($f.parametersValues->at(1), $currentPropertyMapping, $operation, $vars, $state, JoinType.LEFT_OUTER, $nodeId, $aggFromMap, $context, $extensions)->toOne()->cast(@SelectWithCursor).select.columns->at(0);//.value->cast(@Integer);
+   assert($param1->instanceOf(Literal),'Invalid type for parameter inside the drop function. Expected a value, found operation/function');
+   let fromValue = $param1->cast(@Literal);
+   isolateSubSelectIfNotLastOperation(^$mainSelect(fromRow = $fromValue), $mainQuery, $f, $state.functionExpressionStack, $extensions);
+}
+
+function meta::relational::functions::pureToSqlQuery::processAggregation(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   let mergedSQL = $f.parametersValues->map(pv|$pv->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(shouldIsolateNestedFilter=true), $joinType, $nodeId, $aggFromMap, $context, $extensions))->map(x | extractSelectSQLQuery($x))->mergeSQLQueryData($nodeId, $state, $context, $extensions);
+   let mergedResult = if($state.inFilter,|$mergedSQL.filteringOperation,|$mergedSQL.columns);
+
+   //add the primary key for the last variable if we dont have a groupBy in the query
+   let aggregationColumnsReferToCurrentNode = $mergedResult->extractTableAliasColumns().alias->removeDuplicates() == $operation.currentTreeNode.alias;
+   let processingAggregationWithoutMapWithinQualifier = $operation.select.groupBy->isEmpty() && $aggFromMap.values->isEmpty() && $state.inProject && $state.functionReferenceScope->isNotEmpty();
+   let moreAggregationKeys = if( $processingAggregationWithoutMapWithinQualifier && !$aggregationColumnsReferToCurrentNode,
+                        | $state.functionReferenceScope.varToSelect->toOne()->keyValues().second
+                           ->map(swc|
+                                 let keys = $swc.currentTreeNode.alias.relationalElement
+                                    ->match([
+                                             t:Table[1]| $t.primaryKey,
+                                             s:SelectSQLQuery[1]| $s.data.alias.relation->cast(@Table).primaryKey,
+                                             u:Union[1]| assert(false,'Union query not supported'); $u.queries->first()->cast(@SelectSQLQuery).data.alias.relation->cast(@Table).primaryKey;,
+                                             r:RelationFunction[1]| $r.owner.primaryKey->map(c |
+                                                let colType = $c.classifierGenericType.typeArguments->at(1).rawType->toOne();
+                                                ^Column(name = $c.name->toOne(), type = meta::relational::mapping::pureTypeToDataType($colType)->toOne());
+                                             )
+                                          ]);
+                                 ^ColumnGroup(columns = $keys->map(k|^TableAliasColumn(column  =$k ,alias = findOneNode($swc.select.data->toOne(), $swc.currentTreeNode->toOne(), $mergedSQL.data->toOne()).alias)));
+                                 )
+
+                        ,|[]);
+
+   //decide if we want to flatten out nested dynafunctions e.g we need to flatten out when a property is mapped to a plus operation and then is used in another plus operation.
+   let dynaFunction = if(($mergedResult->size() == 1 && $mergedResult->toOne()->instanceOf(DynaFunction) && $mergedResult->toOne()->cast(@DynaFunction).name == $f.func.functionName) && $moreAggregationKeys->isEmpty(),
+                          | $mergedResult->toOne() ,
+                          | newDynaFunction($f.func.functionName->toOne(), if($state.inFilter,|$mergedSQL.filteringOperation,|$mergedSQL.columns)));
+
+   manageAggregation($mergedSQL, $dynaFunction, $operation, $state, $nodeId, list($moreAggregationKeys->concatenate($aggFromMap.values)), $context, $extensions);
+}
+
+function meta::relational::functions::pureToSqlQuery::processRowMapper(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   let select = $operation.select;
+   let columns = $f.parametersValues->map(p|$p->processValueSpecification($currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor).select.columns);
+   ^$operation(select = ^$select(columns = $columns));
+}
+
+function meta::relational::functions::pureToSqlQuery::processWavgRowMapper(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   processAggregation($f, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, list([]->cast(@ColumnGroup)), $context, $extensions);
+}
+
+function meta::relational::functions::pureToSqlQuery::manageAggregation(leftSql:SelectSQLQuery[1], relationalOperation:RelationalOperationElement[1], operation:SelectWithCursor[1], state:State[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):SelectWithCursor[1]
+{
+   let mergedSQL = $leftSql;
+   // Add aggregation function + groupBy
+   let select = if($state.inFilter,
+                   | let new = ^$mergedSQL(filteringOperation = $relationalOperation);
+                     if ($aggFromMap.values->isEmpty(),|$new,|^$new(filteringOperation=$new.filteringOperation, groupBy=$aggFromMap.values->last().columns->concatenate($leftSql.extraFilteringOperation->extractTableAliasColumns()->removeDuplicates())));,
+                   | let new = ^$mergedSQL(columns = $relationalOperation);
+                     if ($aggFromMap.values->isEmpty(),|$new,|^$new(columns=$new.columns, groupBy=$aggFromMap.values->last().columns));
+                );
+
+   let newSelect2 = if ($operation.currentTreeNode->isEmpty(),
+                      |$select,
+                      |let nodeToCut = $operation.currentTreeNode->toOne()->findNode($operation.select.data->toOne(), $select.data->toOne())->toOne();
+                       if ($nodeToCut->children()->isEmpty(),
+                           |$select,
+                           |let withSelfJoinResult = $select->addSelfJoin($nodeToCut, $select.columns->map(q|$q->buildUniqueName(false, $extensions))->makeString('_'), $extensions);
+                            let withSelfJoin = $withSelfJoinResult.first;
+                            let newNodeCut = $nodeToCut->findNode($select.data->toOne(), $withSelfJoin.data->toOne())->toOne();
+                            let newNodeCutChild = $newNodeCut->children()->at(0);
+                            let res = ^$withSelfJoin(groupBy=$withSelfJoin.groupBy->map(g|$g->reprocessAliases(^OldAliasToNewAlias(first=$newNodeCut.alias.name, second=$newNodeCutChild.alias->toOne()))));
+                            let newNode = $nodeToCut->findNode($select.data->toOne(), $res.data->toOne())->map(x|$x->children())->at(0);
+                            $res->buildCorrelatedSubQuery($newNode->cast(@JoinTreeNode)->toOne(), []->cast(@TableAliasColumn), []->cast(@TableAlias), true, $nodeId, false, $newNode->cast(@JoinTreeNode)->toOne(), $state, $extensions).second;
+                       );
+                    );
+
+   ^$operation(select = $newSelect2,
+               currentTreeNode = [],
+               positionBeforeLastApplyJoinTreeNode = []
+   );
+}
+
+function meta::relational::functions::pureToSqlQuery::getPksFromAlias(r:RelationalOperationElement[*], mt:Table[*]):List<Column>[1]
+{
+   ^List<Column>(values=$r->cast(@Alias)->filter(a|$a.relationalElement->instanceOf(TableAliasColumn) && $mt.primaryKey->contains($a.relationalElement->cast(@TableAliasColumn).column))->map(a|let col = $a.relationalElement->cast(@TableAliasColumn).column; ^$col(name=$a.name);));
+}
+
+// Unwraps nested SelectSQLQuery layers to find the leaf relational element (Table, Union, etc.).
+function <<access.private>> meta::relational::functions::pureToSqlQuery::unwrapNestedSelect(elem:RelationalOperationElement[1]):RelationalOperationElement[1]
+{
+   $elem->match([
+      s:SelectSQLQuery[1] | if($s.data->isEmpty(), | $elem, | $s.data->toOne().alias.relationalElement->toOne()->meta::relational::functions::pureToSqlQuery::unwrapNestedSelect()),
+      a:Any[1] | $elem
+   ]);
+}
+
+function meta::relational::functions::pureToSqlQuery::addSelfJoin(s:SelectSQLQuery[1], j:RelationalTreeNode[1], newJoinName:String[1], extensions:Extension[*]):Pair<SelectSQLQuery, List<Pair<JoinTreeNode, JoinTreeNode>>>[1]
+{
+   let rootJtn = $j;
+   let rootJtnAlias = $rootJtn.alias;
+
+   let rootJtnAliasTable = $rootJtnAlias.relationalElement->match([ v:ViewSelectSQLQuery[1]| let pks = ^List<Column>(values=$v.view.primaryKey);
+                                                                                             if($pks.values->isEmpty(), | fail('There is no primary key defined on the view ' + $v.name + ' in ' + $v.schema.name + ' schema.'); false;, | true);
+                                                                                             pair($v.schema.database, $pks);,
+                                                                    t:Table[1]| pair($t.schema.database, ^List<Column>(values=$t.primaryKey)),
+                                                                    u:Union[1]| let mt = $u.queries.data.alias.relationalElement->cast(@Table);
+                                                                                pair($mt.schema.database->at(0), getPksFromAlias($u.queries.columns, $mt));,
+                                                                    select:SelectSQLQuery[1]| // Walk down nested sub-selects to find the leaf Table.
+                                                                                              let inner = $select.data.alias.relationalElement->toOne()->meta::relational::functions::pureToSqlQuery::unwrapNestedSelect();
+                                                                                              assert($inner->instanceOf(Table), 'Add self Join is supported with SelectSQLQuery only when main relationalElement (after unwrapping nested sub-selects) is Table');
+                                                                                              let mt = $inner->cast(@Table);
+                                                                                              // Name-based PK matching (identity compare fails across sub-select boundaries).
+                                                                                              let pkNames = $mt.primaryKey.name;
+                                                                                              let pkCols = $select.columns->cast(@Alias)
+                                                                                                             ->filter(a|$a.relationalElement->instanceOf(TableAliasColumn) &&
+                                                                                                                        ($pkNames->contains($a.relationalElement->cast(@TableAliasColumn).column.name->meta::relational::functions::pureToSqlQuery::stripMatchingQuotes()) || $pkNames->contains($a.name->meta::relational::functions::pureToSqlQuery::stripMatchingQuotes())))
+                                                                                                             ->map(a|let col = $a.relationalElement->cast(@TableAliasColumn).column; ^$col(name = $a.name););
+                                                                                              // Fallback: use all exposed columns if PK not in the subselect.
+                                                                                              let effectivePkCols = if($pkCols->isEmpty(),
+                                                                                                                       | $select.columns->cast(@Alias)
+                                                                                                                           ->filter(a|$a.relationalElement->instanceOf(TableAliasColumn))
+                                                                                                                           ->map(a|let col = $a.relationalElement->cast(@TableAliasColumn).column; ^$col(name = $a.name);),
+                                                                                                                       | $pkCols);
+                                                                                              assert($effectivePkCols->isNotEmpty(), | 'Unable to find any TableAliasColumn columns in the subselect for self-join on Table ' + $mt.name);
+                                                                                              pair($mt.schema.database->at(0), ^List<Column>(values = $effectivePkCols));
+                                                                  ]);
+
+   let rootJtnAliasTablePks = $rootJtnAliasTable.second.values;
+   assert($rootJtnAliasTablePks->isNotEmpty(), | 'Cannot add self-join for alias \'' + $rootJtnAlias.name + '\': no primary key is defined on the underlying ' + $rootJtnAlias.relationalElement->type()->elementToPath() + '. Define a primary key (e.g. ~primaryKey on the table/view, or on the relation function mapping) so a self-join can be generated.');
+   let database = $rootJtnAliasTable.first;
+
+   let genAliasSuffix = $rootJtn->match([
+      root: RootJoinTreeNode[1] | $root,
+      join: JoinTreeNode[1]     | ^RootJoinTreeNode(alias = ^TableAlias(name = 'fakeRoot', relationalElement = ^NamedRelation(name = 'fakeRoot')), childrenData = $join)
+   ])->buildUniqueName(false, $extensions);
+
+   let genJtnAliasName='gen_'+$genAliasSuffix;
+   let genJtnAlias=^$rootJtnAlias(name=$genJtnAliasName);
+
+   let oldAndNewReprocessedJoinJtns = $j->children()->cast(@JoinTreeNode)->map(c|
+      let join = $c.join;
+      let oldToNewAlias = ^OldAliasToNewAlias(first=$rootJtnAlias.name, second=$genJtnAlias);
+      let reprocessedJoinOp = $join.operation->map(o|$o->reprocessAliases($oldToNewAlias))->cast(@Operation);
+      let reprocessedJoin = ^$join(operation=$reprocessedJoinOp, aliases=$join.aliases->map(a|pair($a.first->reprocessAliases($oldToNewAlias)->cast(@TableAlias)->toOne(),$a.second->reprocessAliases($oldToNewAlias)->cast(@TableAlias)->toOne())));
+      let reprocessedAlias = if($c.alias.relationalElement->instanceOf(SemiStructuredArrayFlatten), | let alias = $c.alias; ^$alias(relationalElement = $alias.relationalElement->reprocessAliases($oldToNewAlias));, | $c.alias);
+      pair($c,^$c(join=$reprocessedJoin, alias = $reprocessedAlias));
+   );
+   let reprocessedJoinJtns = $oldAndNewReprocessedJoinJtns.second;
+
+   let joinTreeNodeName = 'gen_'+$genJtnAlias->buildUniqueName(false, $extensions);
+   let nonIsoJoinName = $joinTreeNodeName + $newJoinName;
+
+   let rootToGenJoinOperation = $rootJtnAlias.relationalElement->match([t:Table[1]| meta::relational::functions::pureToSqlQuery::andFilters_RelationalOperationElement_MANY__Extension_MANY__RelationalOperationElement_$0_1$_,
+                                                                        select:SelectSQLQuery[1]| meta::relational::functions::pureToSqlQuery::andFilters_RelationalOperationElement_MANY__Extension_MANY__RelationalOperationElement_$0_1$_,
+                                                                        u:Union[1]| meta::relational::functions::pureToSqlQuery::orFilters_RelationalOperationElement_MANY__Extension_MANY__RelationalOperationElement_$0_1$_]);
+
+
+   let rootJtnToGenJtnSelfJoinOp = $rootToGenJoinOperation->eval($rootJtnAliasTablePks->map(c|^DynaFunction(name = 'equal', parameters=[^TableAliasColumn(alias=$rootJtnAlias, column=$c), ^TableAliasColumn(alias=$genJtnAlias, column=$c)])), $extensions);
+
+   let rootJtnToGenJtnJoin = ^Join(name=$nonIsoJoinName, target=$genJtnAlias, aliases=[pair($rootJtnAlias,$genJtnAlias),pair($genJtnAlias,$rootJtnAlias)],operation=$rootJtnToGenJtnSelfJoinOp->cast(@Operation)->toOne());
+   let rootJtnToGenJtnJoinTreeNode = ^JoinTreeNode(childrenData=$reprocessedJoinJtns, joinName=$joinTreeNodeName, database=$database, alias=$genJtnAlias, join=$rootJtnToGenJtnJoin, joinType=JoinType.LEFT_OUTER);
+   let rootJtnWithGenChildJtn = ^$rootJtn(childrenData=$rootJtnToGenJtnJoinTreeNode);
+
+   let newSelect = ^$s(data=$s.data->toOne()->replaceTreeNode($j, $rootJtnWithGenChildJtn)->cast(@RootJoinTreeNode));
+
+   pair($newSelect, ^List<Pair<JoinTreeNode, JoinTreeNode>>(values = $oldAndNewReprocessedJoinJtns));
+}
+
+function meta::relational::functions::pureToSqlQuery::processIsEmpty(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   processEmpty($f, true, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)
+}
+
+function meta::relational::functions::pureToSqlQuery::processIsNotEmpty(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   processEmpty($f, false, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)
+}
+
+function meta::relational::functions::pureToSqlQuery::processEmpty(f:FunctionExpression[1],not:Boolean[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   let param = $f.parametersValues->at(0);
+   $param->byPassRouterInfo()->match(
+      [
+         fe:FunctionExpression[1] |
+            $fe.genericType.rawType->match(
+                  [
+                     d:DataType[1]| $f->processSubEmpty($currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+                     ,c:Class<Any>[1] | processExists($f, $not, $currentPropertyMapping, $operation, $vars, $state, $nodeId, $aggFromMap, $context, $extensions)
+                  ]
+            )
+        ,a:Any[1] | $f->processSubEmpty($currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+      ]
+   );
+}
+
+function meta::relational::functions::pureToSqlQuery::findFunctionSequenceMultiplicity(v:ValueSpecification[1]):Pair<FunctionExpression,Multiplicity>[*]
+{
+   let toMultiplicity = {fe: FunctionExpression[*] | let v = $fe->evaluateAndDeactivate()->last()->cast(@FunctionExpression); if(!$v.resolvedMultiplicityParameters->isEmpty(),|$v.resolvedMultiplicityParameters,| $v.multiplicity)->toOne();};
+
+   $v->match([ fe:FunctionExpression[1]| $fe.func->match([qp:QualifiedProperty<Any>[1]| $qp.expressionSequence->at(0)->findFunctionSequenceMultiplicity()
+                                                         ,a:Any[1]|pair($fe, $toMultiplicity->eval($fe))])
+                                                  ->concatenate(if($fe.parametersValues->size() > 0,| $fe.parametersValues->at(0)->findFunctionSequenceMultiplicity(),|[]));,
+               e:StoreMappingRoutedValueSpecification[1]|$e->byPassRouterInfo()->findFunctionSequenceMultiplicity(),
+               a:Any[1]|[]
+             ]);
+}
+
+function meta::relational::functions::pureToSqlQuery::expressionSequenceReturnsAtLeastToOneDataType(v:ValueSpecification[1]):Boolean[1]
+{
+  let isToOne = {fs:Pair<FunctionExpression,Multiplicity>[*]|let funs = if($fs->head().first.func == map_T_m__Function_1__V_m_  || $fs->head().first.func == map_T_MANY__Function_1__V_MANY_
+                                                                          ,|$fs ,|$fs->tail());
+                                                             $funs->map(p|pair(if($p.first.func->instanceOf(NativeFunction),|$p.first.func.functionName,|'')->toOne(), $p.second))->fold({fm, a| pair($fm.first, ($a.first->in(['toOne','toOneMany']) || (getLowerBound($fm.second) >= 1)) && $a.second)}, pair('',true));
+                 };
+
+  $v->match([i :InstanceValue[1] | $i.multiplicity->getLowerBound() >= 1; ,
+             ve:VariableExpression[1] | $ve.multiplicity->getLowerBound() >= 1;,
+             v: ValueSpecification[1] | $isToOne->eval(findFunctionSequenceMultiplicity($v)->evaluateAndDeactivate()).second;
+           ]);
+}
+
+function meta::relational::functions::pureToSqlQuery::processIsEmptyOnPlanVar(v:VariableExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   assert(!$v.genericType.rawType->toOne()->instanceOf(Class), | 'IsEmpty null checks should only occur on DataTypes, Variable Expression: ' + $v.name + ' does not contain a datatype value');
+   let sqlQuery = $v->processValueSpecification($currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)->toOne()->extractSelectSQLQuery()->mergeSQLQueryData($nodeId, $state, $context, $extensions);
+   let columns = $state.inFilter->if(|$sqlQuery.filteringOperation, |$sqlQuery.columns);
+   assertNotEmpty($columns, 'Error, no columns found when processing IsEmpty or IsNotEmpty');
+
+   let res = ^DynaFunction(name = 'equal',
+                           parameters = [^FreeMarkerOperationHolder(name = 'variableCollectionSize',
+                                                                    parameters = [$columns]),
+                                         ^Literal(value = 0)]);
+   ^$operation(
+      select = $state.inFilter->if(
+         | ^$sqlQuery(filteringOperation = $res);,
+         | ^$sqlQuery(columns = $res);
+      ),
+      currentTreeNode = [],
+      positionBeforeLastApplyJoinTreeNode = []
+   );
+}
+
+function meta::relational::functions::pureToSqlQuery::isParamPlanVar(param:ValueSpecification[1], vars:Map<VariableExpression, ValueSpecification>[1], openVars:Map<String, List<Any>>[1]):Boolean[1]
+{
+   if($param->instanceOf(VariableExpression),
+      |let resolvedVar = $param->cast(@VariableExpression)->resolve($vars, $openVars)->evaluateAndDeactivate();
+      if(!$resolvedVar->isEmpty() && $resolvedVar->toOne()->instanceOf(InstanceValue) && $resolvedVar->cast(@InstanceValue).values->size() == 1
+         && $resolvedVar->cast(@InstanceValue).values->toOne()->instanceOf(PlanVarPlaceHolder),
+         |true,
+         |false);,
+      |false)
+}
+
+function meta::relational::functions::pureToSqlQuery::processSubEmpty(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   let parameters = $f.parametersValues->at(0);
+   let isParameterPlanVarOfTypeList = isParamPlanVar($parameters, $vars, $state.inScopeVars) && $parameters.multiplicity == ZeroMany;
+
+   let isEmptyExpressionValid = $parameters->match([v:FunctionExpression[1]| $v.func == map_T_m__Function_1__V_m_  || $v.func == map_T_MANY__Function_1__V_MANY_ || !$v.genericType.rawType->toOne()->instanceOf(Class);,
+                                                    a:Any[1]| true;]);
+
+
+   assert($isEmptyExpressionValid, | 'IsEmpty null checks should only occur on DataTypes, function: '+$parameters->asString()+' does not return a DataType');
+
+   if($isParameterPlanVarOfTypeList,
+      |processIsEmptyOnPlanVar($parameters->cast(@VariableExpression), $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions),
+      |
+      let mergedSQL = if($state.inFilter
+                         && !expressionSequenceReturnsAtLeastToOneDataType($parameters)
+                         ,| let forcedIsolationContext = ^RelationalDebugContext(forcedIsolation=IsolationStrategy.MoveFilterInOnClause, space=$context.space, debug=$context.debug);
+                         let isolatedIsEmptyState = ^$state(inIsolatedIsEmpty=true);
+                         let processedParams = $f.parametersValues->map(pv|$pv->processValueSpecification($currentPropertyMapping, $operation, $vars, $isolatedIsEmptyState, $joinType, $nodeId, $aggFromMap, $forcedIsolationContext, $extensions))->map(x | extractSelectSQLQuery($x));
+                         $processedParams->mergeSQLQueryData($nodeId, $isolatedIsEmptyState, $forcedIsolationContext, $extensions);
+                         ,| let processedParams = $f.parametersValues->map(pv|$pv->processValueSpecification($currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions))->map(x | extractSelectSQLQuery($x));
+                         let mergedSql = $processedParams->mergeSQLQueryData($nodeId, $state, $context, $extensions);
+                      );
+
+      let columns = $state.inFilter->if(|$mergedSQL.filteringOperation, |$mergedSQL.columns);
+      assertNotEmpty($columns, 'Error, no columns found when processing IsEmpty or IsNotEmpty');
+      ^$operation(
+            select = $state.inFilter->if(
+                                    | ^$mergedSQL(filteringOperation = newDynaFunction($f.func.functionName->toOne(), $columns));,
+                                    | ^$mergedSQL(columns = newDynaFunction($f.func.functionName->toOne(), $columns));
+                                  ),
+            currentTreeNode = [],
+            positionBeforeLastApplyJoinTreeNode = []
+      );
+   );
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::isIfForEnum(f:FunctionExpression[1], inFilter:Boolean[1]):Boolean[1]
+{
+   $f.func.functionName->toOne()=='if' && !$inFilter && $f.genericType.rawType->toOne()->instanceOf(Enumeration)
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::processIfForEnum(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):Pair<List<RelationalOperationElement>,meta::pure::metamodel::function::Function<{RelationalOperationElement[1]->RelationalOperationElement[1]}>>[1]
+{
+   print(if(!$context.debug, |'',
+            | $context.space+'Processing "if for enum"\n'));
+
+   let execSides = $f.parametersValues->tail()->map(p|pair($p,$p->byPassRouterInfo()->cast(@InstanceValue).values->cast(@LambdaFunction<Any>)->toOne()));
+   let propertyMappings = $execSides.second.expressionSequence->map(e|
+                                                               let classPropertyPair = $e->findPropertySequence()->first();
+                                                               if(!$classPropertyPair->isEmpty(),| let class = $classPropertyPair.first;
+                                                                                                   let propertyName = $classPropertyPair.second.name->toOne();
+                                                                                                   let classMapping = $state.mapping->toOne()->_classMappingByClass($class->toOne());
+                                                                                                   $classMapping->cast(@PropertyMappingsImplementation)->map(x|$x->_propertyMappingsByPropertyName($propertyName));
+                                                                                                ,|[]);
+                                                             );
+
+   let distinctTransformers = $propertyMappings->filter(m|$m->instanceOf(RelationalPropertyMapping))->cast(@RelationalPropertyMapping).transformer->distinct();
+   let semiStructuredMappings = $propertyMappings->filter(m|$m->instanceOf(RelationalPropertyMapping))->forAll(x|$x->instanceOf(SemiStructuredRelationalPropertyMapping));
+
+   assertFalse($distinctTransformers->size() > 1 && ($distinctTransformers->removeDuplicates({t1, t2 | meta::pure::mapping::valueTransformerEquality($t1, $t2)})->size() > 1), 'Unable to determine a unique Enum property mapping for an if stmt (returning an Enum)');
+   if ($semiStructuredMappings,
+       | print(if(!$context.debug, |'', |$context.space+'  Ignoring distinct transformer check as all property mappings are semi structured property mappings\n'));,
+       | assertFalse($distinctTransformers->isEmpty(), 'Unable to determine the Enum property mapping for an if stmt (returning an Enum)');
+   );
+
+   print(if(!$context.debug, |'',
+            | $context.space+'  Found '+$distinctTransformers->size()->toString()+' distinct transformers\n'));
+
+   let foundEnumPropertyMapping = $propertyMappings->head();
+   let isEnumConstantSide = {l:LambdaFunction<Any>[1] |
+         $l.expressionSequence->match([
+            sfe : SimpleFunctionExpression[1]| $sfe.func == extractEnumValue_Enumeration_1__String_1__T_1_,
+            iv : InstanceValue[1]|$iv.values->size() == 1 && $iv.values->toOne()->instanceOf(Enum),
+            vs:ValueSpecification[*]|false
+            ]);
+         };
+
+  let pred = $f.parametersValues->at(0)->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(pushDownEnumTransformations=false), $joinType, $nodeId, $aggFromMap, $context, $extensions);
+
+  let sides = $execSides->map(s|
+      if($isEnumConstantSide->eval($s.second) && $foundEnumPropertyMapping->isEmpty(),
+        | let enumName = $s.second.expressionSequence->toOne()->match([
+          sfe : SimpleFunctionExpression[1] | $sfe->instanceValueAtParameter(1)->cast(@String),
+          iv : InstanceValue[1] | $iv.values->toOne()->cast(@Enum).name
+      ]);
+      let sel = $operation.select;
+      ^$operation(select = ^$sel(columns = ^Literal(value = $enumName)));,
+      | $s.first->processValueSpecification(if($isEnumConstantSide->eval($s.second),
+                                                                        |print(if(!$context.debug, |'', | $context.space+'  Enum in if is a constant\n'));
+                                                                         $foundEnumPropertyMapping;,
+                                                                        |print(if(!$context.debug, |'', | $context.space+'  Enum in if is NOT a constant\n'));
+                                                                         $currentPropertyMapping;
+                                                                     ), $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)));
+
+   pair(^List<RelationalOperationElement>(values=$pred->concatenate($sides)),{r:RelationalOperationElement[1]|^OperationWithParentPropertyMapping(element=$r, currentPropertyMapping=$foundEnumPropertyMapping)});
+}
+
+function meta::relational::functions::pureToSqlQuery::moveExtraFilterToFilter(s:SelectWithCursor[1], extensions:Extension[*]):SelectWithCursor[1]
+{
+   ^$s(select=$s.select->moveExtraFilterToFilter($extensions));
+}
+
+function meta::relational::functions::pureToSqlQuery::moveExtraFilterToFilter(s:SelectSQLQuery[1], extensions:Extension[*]):SelectSQLQuery[1]
+{
+   let filters = $s.filteringOperation->concatenate($s.extraFilteringOperation);
+   ^$s(
+         extraFilteringOperation=[],
+         filteringOperation = if ($filters->size() > 1,|^DynaFunction(name = 'group', parameters = $filters->andFilters($extensions)->toOne()),|$filters)
+   );
+}
+
+function meta::relational::functions::pureToSqlQuery::processWindowFunction(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+  let win = $state.currentWindow->toOne();
+  ^$win
+  (
+    func = ^DynaFunction
+            (
+              name = $f.func.functionName->toOne(),
+              parameters = $f.parametersValues->tail()->map(p|$p->match([
+                                                                          ve:VariableExpression[1] | [],
+                                                                          vs:ValueSpecification[1] | $vs->processValueSpecification($currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor).select.columns
+                                                                        ])
+              )
+            )
+  );
+}
+
+function meta::relational::functions::pureToSqlQuery::processDivideRound(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+  processDynaFunction('divideRound', $f, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+}
+
+// Pure indexes are 0-based with an exclusive end; SQL's are 1-based with a length.
+function meta::relational::functions::pureToSqlQuery::processSubstr(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+  processDynaFunction('substring', correctSubstrIndices_RelationalOperationElement_MANY__RelationalOperationElement_MANY_, $f, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+}
+
+// Correcting substring unconditionally would change the results of existing queries, hence the flag.
+function meta::relational::functions::pureToSqlQuery::processSubstring(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+  if($state.correctSubstringIndexing,
+     | processSubstr($f, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions),
+     | processDynaFunction('substring', $f, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions));
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::substrIntLiteral(op:RelationalOperationElement[1]):Integer[0..1]
+{
+  $op->unwrapAlias()->toOne()->match([
+    l:Literal[1]                     | $l.value->match([i:Integer[1] | $i, a:Any[1] | []]),
+    r:RelationalOperationElement[1]  | []
+  ]);
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::correctSubstrIndices(params:RelationalOperationElement[*]):RelationalOperationElement[*]
+{
+  let str = $params->at(0);
+  let start = $params->at(1);
+  let startLiteral = $start->substrIntLiteral();
+
+  let newStart = if($startLiteral->isNotEmpty(),
+                    | ^Literal(value = $startLiteral->toOne() + 1),
+                    | newDynaFunction('plus', [$start, ^Literal(value = 1)]));
+
+  if($params->size() == 2,
+     | [$str, $newStart],
+     | let end = $params->at(2);
+       let endLiteral = $end->substrIntLiteral();
+       let length = if($startLiteral->isNotEmpty() && $endLiteral->isNotEmpty(),
+                       | ^Literal(value = $endLiteral->toOne() - $startLiteral->toOne()),
+                       | newDynaFunction('minus', [$end, $start]));
+       [$str, $newStart, $length];);
+}
+
+function meta::relational::functions::pureToSqlQuery::processTimeBucket(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+  let unit = $f.parametersValues->at(2)->cast(@ValueSpecification)->map(v|$v->reprocessVS()->reactivate($state.inScopeVars)->cast(@DurationUnit))->toOne();
+  let dateType = $f.genericType.rawType->toOne();
+  assert($dateType == DateTime || $unit->in([DurationUnit.YEARS, DurationUnit.DAYS, DurationUnit.MONTHS, DurationUnit.WEEKS]), | 'Unsupported duration unit for StrictDate. Units can only be: [YEARS, DAYS, MONTHS, WEEKS]');
+  let timeBucketDynaFn = processDynaFunction('timeBucket', $f, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+}
+
+function meta::relational::functions::pureToSqlQuery::processFromJson(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+  processDynaFunction('parseJson', $f, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+}
+
+function meta::relational::functions::pureToSqlQuery::processToJson(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+  processDynaFunction('toJson', $f, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+}
+
+// eval(~col, $row) is how the ColSpec-based aggregates read their column; relationally that is simply a
+// reference to the column, resolved against the aliases the enclosing map set up.
+function meta::relational::functions::pureToSqlQuery::processRelationEval(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   let colSpec = $f->instanceValuesAtParameter(0, $vars, $state.inScopeVars)->toOne()->cast(@meta::pure::metamodel::relation::ColSpec<Any>);
+   let aliases = if($state.aliases->isEmpty(), | $operation.select.columns, | $state.aliases);
+   let col = findAliasOrFail($colSpec.name, $aliases).relationalElement;
+   let select = $operation.select;
+   ^$operation(select = $state.inFilter->if(| ^$select(filteringOperation = $col), | ^$select(columns = $col)));
+}
+
+// Binding reduce covers every aggregate written on top of it: processAggFn names the dyna after whatever the
+// reduce lambda calls.
+function meta::relational::functions::pureToSqlQuery::processRelationReduce(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   let mapFunc = $f.parametersValues->at(1)->byPassRouterInfo()->cast(@InstanceValue).values->at(0)->cast(@FunctionDefinition<Any>);
+   let aggFunc = $f.parametersValues->at(2)->byPassRouterInfo()->cast(@InstanceValue).values->at(0)->cast(@FunctionDefinition<Any>);
+
+   let aggContainer = ^AggContainer(name='reduce', map=$mapFunc, reduce=$aggFunc);
+   let agg = processRelationMapReduce($aggContainer, true, '', $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+
+   let sorts = if($f.parametersValues->size() < 4,
+                  | [],
+                  | $f->instanceValuesAtParameter(3, $vars, $state.inScopeVars)->cast(@meta::pure::functions::relation::SortInfo<Any>));
+
+   // processRelationMap already rewrote these into the coordinate system the aggregate is emitted in, and
+   // filters window columns out of what the aggregate sees -- match it so the ordering cannot drift.
+   let sortAliases = $state.aliases->filter(c | !$c->instanceOf(meta::relational::metamodel::WindowColumn));
+
+   // Alternating column/direction parameters because DynaFunction.parameters is a RelationalOperationElement
+   // list and SortByInfo is not one.
+   let result = if ($sorts->isEmpty(),
+                    | $agg,
+                    | let sortParams = $sorts->map(s | findAliasOrFail($s.column.name, $sortAliases).relationalElement
+                                                         ->concatenate(^Literal(value = if($s.direction == meta::pure::functions::relation::SortType.ASC, |'ASC', |'DESC'))));
+                      newDynaFunction('withinGroup', $agg->concatenate($sortParams));
+                );
+
+   let select = $operation.select;
+   ^$operation(select = ^$select(columns = $result));
+}
+
+function meta::relational::functions::pureToSqlQuery::processReduceWindow(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+    let win = $state.currentWindow->toOne('not in window aggregation flow!');
+
+    let mapFunc = $f.parametersValues->at(3)->byPassRouterInfo()->cast(@InstanceValue).values->at(0)->cast(@FunctionDefinition<Any>);
+    let aggFunc = $f.parametersValues->at(4)->byPassRouterInfo()->cast(@InstanceValue).values->at(0)->cast(@FunctionDefinition<Any>);
+
+    let aggContainer = ^AggContainer(name='reduce', map=$mapFunc, reduce=$aggFunc);
+    let result = processRelationMapReduce($aggContainer, true, '', $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+    let select = $operation.select;
+    ^$operation(select = ^$select(columns = $result));
+}
+
+function meta::relational::functions::pureToSqlQuery::processTo(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+  let valueParam = $f.parametersValues->at(0);
+  let value = $valueParam->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor).select.columns->toOne();
+
+  let valueToCast = if($f.parametersValues->size() > 2,
+    |
+      let typeName = $f->instanceValueAtParameter(2)->cast(@String);
+
+      // routing does not propagate type arguments properly, hence reactivation is not possible until that is fixed
+      let newPairFe = $f.parametersValues->evaluateAndDeactivate()->at(3)->cast(@InstanceValue).values->cast(@SimpleFunctionExpression);
+      $newPairFe->forAll(x | $x->isNewPairFunction())->assert(|'type lookup on to() function should be pair() functions!');
+      let typeLookup = $newPairFe->map(p |
+        let ke = $p.parametersValues->evaluateAndDeactivate()->drop(2)->cast(@InstanceValue).values->cast(@KeyExpression)->sortBy(x | $x.key->reactivate()->cast(@String)->toOne()); // pair has 2 properties, "first" and "second"... alphabetically "first" goes before "second"...
+        let first = $ke->at(0).expression->reactivate()->toOne()->cast(@String);
+        let second = $ke->at(1).expression->reactivate()->toOne()->cast(@Class<Any>);
+        pair($first, $second);
+      );
+
+      let typedSemiStructured = ^meta::relational::metamodel::datatype::TypedSemiStructured(typeName = $typeName, typeLookup = $typeLookup);
+      newDynaFunction('variantTo', [$value, ^DataTypeInfo(dataType = $typedSemiStructured)]);
+    ,
+    |
+      $value;
+  );
+
+  let typeParam = $f.parametersValues->at(1);
+
+  let dataType = $typeParam.genericType->genericTypeToDataType(ZeroOne);
+
+  // dont cast if going from variant to variant
+  let toValue = $dataType->match([
+    s: meta::relational::metamodel::datatype::SemiStructured[1] | $valueToCast,
+    o: meta::relational::metamodel::datatype::Object[1] | $valueToCast,
+    any: Any[1] | newDynaFunction('variantTo', [$valueToCast, ^DataTypeInfo(dataType = $dataType)])
+  ]);
+
+  let select = $operation.select;
+  ^$operation(select = $state.inFilter->if(|^$select(filteringOperation = $toValue),|^$select(columns = $toValue)));  
+}
+
+function meta::relational::functions::pureToSqlQuery::processToMany(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+  let valueParam = $f.parametersValues->at(0);
+  let value = $valueParam->processValueSpecification($currentPropertyMapping, $operation, $vars, ^$state(inFilter = false), $joinType, $nodeId, $aggFromMap, $context, $extensions)->cast(@SelectWithCursor).select.columns->toOne();
+
+  let valueToCast = if($f.parametersValues->size() > 2,
+    |
+      let typeName = $f->instanceValueAtParameter(2)->cast(@String);
+
+      // routing does not propagate type arguments properly, hence reactivation is not possible until that is fixed
+      let newPairFe = $f.parametersValues->evaluateAndDeactivate()->at(3)->cast(@InstanceValue).values->cast(@SimpleFunctionExpression);
+      $newPairFe->forAll(x | $x->isNewPairFunction())->assert(|'type lookup on to() function should be pair() functions!');
+      let typeLookup = $newPairFe->map(p |
+        let ke = $p.parametersValues->evaluateAndDeactivate()->drop(2)->cast(@InstanceValue).values->cast(@KeyExpression)->sortBy(x | $x.key->reactivate()->cast(@String)->toOne()); // pair has 2 properties, "first" and "second"... alphabetically "first" goes before "second"...
+        let first = $ke->at(0).expression->reactivate()->toOne()->cast(@String);
+        let second = $ke->at(1).expression->reactivate()->toOne()->cast(@Class<Any>);
+        pair($first, $second);
+      );
+
+      let typedSemiStructured = ^meta::relational::metamodel::datatype::TypedSemiStructured(typeName = $typeName, typeLookup = $typeLookup);
+      newDynaFunction('variantTo', [$value, ^DataTypeInfo(dataType = $typedSemiStructured)]);
+    ,
+    |
+      $value;
+  );
+
+  let dataType = $f.parametersValues->at(1).genericType->genericTypeToDataType(ZeroOne);
+
+  let toValue = newDynaFunction('variantTo', [$valueToCast, ^DataTypeInfo(dataType = ^meta::relational::metamodel::datatype::Array(type = $dataType))]);
+
+  let select = $operation.select;
+  ^$operation(select = $state.inFilter->if(|^$select(filteringOperation = $toValue),|^$select(columns = $toValue)));    
+}
+
+function meta::relational::functions::pureToSqlQuery::processDynaFunction(f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+  processDynaFunction($f.func.functionName->toOne(), $f, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+}
+
+function meta::relational::functions::pureToSqlQuery::processDynaFunction(name:String[1], f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+  processDynaFunction($name, {x|$x}, $f, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions);
+}
+
+function meta::relational::functions::pureToSqlQuery::processDynaFunction(name:String[1], dynaFuncParameterProcessor: FunctionDefinition<{RelationalOperationElement[*]->RelationalOperationElement[*]}>[1], f:FunctionExpression[1], currentPropertyMapping:PropertyMapping[*], operation:SelectWithCursor[1], vars:Map<VariableExpression, ValueSpecification>[1], state:State[1], joinType:JoinType[1], nodeId:String[1], aggFromMap:List<ColumnGroup>[1], context:DebugContext[1], extensions:Extension[*]):RelationalOperationElement[1]
+{
+   let isIfTrueFalseStmt = $f.func == if_Boolean_1__Function_1__Function_1__T_m_ || $state.inIf == true;
+   let paramIsIfTrueFalseStmt = {paramIndex:Integer[1]|$state.inIf == true && $paramIndex->in([1,2])};
+   let funcParameters = $f.func->genericType().typeArguments.rawType->cast(@FunctionType).parameters;
+
+   let processedParams = if($f->isIfForEnum($state.inFilter),| processIfForEnum($f, $currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context, $extensions)
+                                                            ,| let zippedParameters = $f.parametersValues->size()->range()->zip($f.parametersValues);
+                                                               pair(^List<RelationalOperationElement>(values=$zippedParameters->map(pv| let updatedState = if($f.func == if_Boolean_1__Function_1__Function_1__T_m_ && $pv.first == 0 && $state.pushDownEnumTransformations, |^$state(pushDownEnumTransformations = false), |if($paramIsIfTrueFalseStmt->eval($pv.first),|^$state(inIfTrueFalseStmt=true),|$state));
+                                                                                                                                        $pv.second->processValueSpecification($currentPropertyMapping, $operation, $vars, $updatedState, $joinType, buildNodeId($nodeId,'_dy'+$pv.first->toString()), $aggFromMap, $context, $extensions);)),{res:RelationalOperationElement[1]|$res}););
+
+   let parameterSQL = $processedParams.first.values->map(x | extractSelectSQLQuery($x));//$f.parametersValues->map(pv|$pv->processValueSpecification($currentPropertyMapping, $operation, $vars, $state, $joinType, $nodeId, $aggFromMap, $context))->map(x | extractSelectSQLQuery($x));
+
+   let mergedSQL = if ($parameterSQL->isEmpty(),
+                     | $operation.select,
+                     | let sqls = if ($parameterSQL->size() > 1,
+                           | let zippedParameterSQLs = $parameterSQL->size()->range()->zip($parameterSQL);
+                             $zippedParameterSQLs->map(s| let updatedState = if($isIfTrueFalseStmt,|^$state(inIfTrueFalseStmt=true, shouldIsolate=true),|^$state(shouldIsolate=true));
+                                                          $s.second->manageIsolation([], [],  $nodeId, false, $updatedState, $context, $extensions););,
+                           | $parameterSQL
+                       );
+                       let nsqls =
+                                     if($name != 'or',
+                                       |$sqls,
+                                       |$sqls->map(s|$s->moveExtraFilterToFilter($extensions))
+                                     );
+                       $nsqls->mergeSQLQueryData($nodeId, $state, $context, $extensions);
+               );
+
+   let res = ^$operation(select = $state.inFilter->if(
+                           | let unSupportedBiTemporalProcessing = $mergedSQL.filteringOperation->isEmpty() && $operation.milestoningContext->isNotEmpty() && $operation.milestoningContext->toOne()->isBiTemporalMilestoningTopLevelAnd($f.func);
+                             if($unSupportedBiTemporalProcessing ,| $mergedSQL
+                                                                 ,| ^$mergedSQL(filteringOperation = newDynaFunction($name, $dynaFuncParameterProcessor->eval(if($parameterSQL->isEmpty() || $funcParameters->isEmpty(), |[], |$mergedSQL.filteringOperation)))));,
+                           | ^$mergedSQL(columns = newDynaFunction($name, $dynaFuncParameterProcessor->eval(if($funcParameters->isEmpty(), |[], |$mergedSQL.columns))))
+                        ),
+                        currentTreeNode = [],
+                        positionBeforeLastApplyJoinTreeNode = []
+                     );
+
+   $processedParams.second->eval($res);
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::unwrapAlias<|N>(params: RelationalOperationElement[N]): RelationalOperationElement[N]
+{
+   let unwrapped = $params->map(p | $p->match([
+    a: Alias[1] | $a.relationalElement,
+    roe: RelationalOperationElement[1] | $roe
+   ])); 
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::newDynaFunction(name: String[1], params: RelationalOperationElement[*]): DynaFunction[1]
+{
+   let unwrapped = $params->unwrapAlias(); 
+   if($name->in(['and','or']),
+               | newAndOrDynaFunctionWrappedInGroup($name, $unwrapped),
+               | ^DynaFunction(name = $name, parameters = $unwrapped)
+     );
+}
+
+function <<access.private>> meta::relational::functions::pureToSqlQuery::newAndOrDynaFunctionWrappedInGroup(name: String[1], params: RelationalOperationElement[*]): DynaFunction[1]
+{
+   ^DynaFunction(name = 'group', parameters = ^DynaFunction(name = $name, parameters = $params));
+}
+
+function meta::relational::functions::pureToSqlQuery::newAndOrDynaFunctionRelaxedBrackets(funcName: String[1], params: RelationalOperationElement[*]): DynaFunction[1]
+{
+   let potentiallyWrapedParams = $params->map(p | $p->match([ d: DynaFunction[1] | if($d.name->in(['and','or']) && $d.name != $funcName, | ^DynaFunction(name='group', parameters=$d), | $d),
+                                                              r: RelationalOperationElement[1] | $r
+                                                            ])
+                                              );
+   ^DynaFunction(name = $funcName, parameters = $potentiallyWrapedParams);
+}
+
+function meta::relational::functions::pureToSqlQuery::extractElement(z:RelationalOperationElement[1]):RelationalOperationElement[1]
+{
+   $z->match([ j:RelationalOperationElementWithJoin[1] | $j.relationalOperationElement,
+               r:RelationalOperationElement[1] | $r
+            ])->toOne()
+}
+
