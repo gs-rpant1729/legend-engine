@@ -1,0 +1,19 @@
+{
+  "effortLevel": "high",
+  "permissions": {
+    "allow": [
+      "Bash",
+      "Bash(xargs du -sh --total)",
+      "Bash(xargs -0 du -sc)",
+      "Bash(bc)",
+      "Bash(xargs -0 du -sk)",
+      "Bash(awk '{sum += $1} END {printf \"%.2f GB\\\\n\", sum/1024/1024}')",
+      "Bash(awk '{sum += $1} END {printf \"%.2f MB\\\\n\", sum/1024}')",
+      "Bash(awk '{sum += $1} END {printf \"%.0f MB\\\\n\", sum/1024}')",
+      "Bash(wait)",
+      "Bash(gh --version)",
+      "Bash(grep -n -B2 -A 25 \"<groupId>org.apache.maven.plugins</groupId>[[:space:]]*$\" pom.xml)",
+      "Bash(git ls-tree *)"
+    ]
+  }
+}

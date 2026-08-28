@@ -28,7 +28,7 @@ import meta::pure::mapping::*;
 
 // ToFix: Union on both sides of model join — filtering Person.firm navigates the model join during SQL generation
 // but the SQL query builder expects a NamedRelation and instead finds a RelationFunction.
-// Error: 'Cast exception: RelationFunction cannot be cast to NamedRelation' (pureToSQLQuery.pure:10133).
+// Error: 'Cast exception: RelationFunction cannot be cast to NamedRelation' (pureToSQLQuery_registry.pure).
 function <<test.ToFix, test.AlloyOnly>> meta::relational::tests::mapping::union::relation::advanced::testUnionTwoRelationMappings_FilterFromFirm():Boolean[1]
 {
    let resultFirmX = execute(
@@ -242,7 +242,7 @@ function <<test.ToFix, test.AlloyOnly>> meta::relational::tests::mapping::union:
 
 // ToFix: Union of sub-aggregated relation mappings — filtering from Person.firm through the model join causes
 // the SQL query builder to encounter a RelationFunction where a NamedRelation is expected.
-// Error: 'Cast exception: RelationFunction cannot be cast to NamedRelation' (pureToSQLQuery.pure:10133).
+// Error: 'Cast exception: RelationFunction cannot be cast to NamedRelation' (pureToSQLQuery_registry.pure).
 function <<test.ToFix, test.AlloyOnly>> meta::relational::tests::mapping::union::relation::advanced::testUnionOfSubAggregations_FilterFromFirm():Boolean[1]
 {
    let resultFirmX = execute(
