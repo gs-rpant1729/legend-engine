@@ -1,0 +1,270 @@
+<!doctype html>
+<html><head><meta charset="utf8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body>
+<title>Window Columns Without the Ceremony</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Spline+Sans:wght@400;500;600;700&family=Spline+Sans+Mono:wght@400;500;600&display=swap">
+<style>
+:root {
+  --bg: #F6F7F8; --surface: #FFFFFF; --ink: #1E2833; --muted: #5D6B78; --line: #DEE3E8;
+  --accent: #0E7C86; --accent-soft: #E4F1F1; --sql: #8A5E12; --sql-soft: #F7F0E1;
+  --warn: #A34A2A; --good: #2E7D4F; --code-bg: #F0F2F4;
+  --sans: 'Spline Sans', 'Segoe UI', system-ui, sans-serif;
+  --mono: 'Spline Sans Mono', 'SF Mono', Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #131A21; --surface: #1A232C; --ink: #E3E9EE; --muted: #93A1AE;
+    --line: #2B3641; --accent: #4CC2CB; --accent-soft: #14343A;
+    --sql: #D9A855; --sql-soft: #2E2716; --warn: #E08A63; --good: #6BC493; --code-bg: #10161C;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #131A21; --surface: #1A232C; --ink: #E3E9EE; --muted: #93A1AE;
+  --line: #2B3641; --accent: #4CC2CB; --accent-soft: #14343A;
+  --sql: #D9A855; --sql-soft: #2E2716; --warn: #E08A63; --good: #6BC493; --code-bg: #10161C;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--ink); font-family: var(--sans); font-size: 16px; line-height: 1.65; margin: 0; padding: 0 1.25rem 6rem; }
+.page { max-width: 64rem; margin: 0 auto; }
+.prose { max-width: 46rem; }
+header.doc-head { padding: 4rem 0 2.5rem; border-bottom: 1px solid var(--line); margin-bottom: 3rem; }
+.eyebrow { font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent); font-weight: 600; margin: 0 0 1rem; }
+h1 { font-size: clamp(1.9rem, 4.5vw, 2.6rem); font-weight: 700; line-height: 1.15; letter-spacing: -0.02em; margin: 0 0 1rem; text-wrap: balance; }
+.lede { font-size: 1.06rem; color: var(--muted); max-width: 44rem; margin: 0; }
+h2 { font-size: 1.4rem; font-weight: 700; letter-spacing: -0.01em; margin: 3.2rem 0 1rem; text-wrap: balance; scroll-margin-top: 1rem; }
+h2 .secno, h3 .secno { font-family: var(--mono); font-size: 0.78em; color: var(--accent); font-weight: 600; margin-right: 0.6em; }
+h3 { font-size: 1.05rem; font-weight: 600; margin: 2rem 0 0.6rem; text-wrap: balance; }
+p { margin: 0 0 1rem; }
+a { color: var(--accent); }
+code { font-family: var(--mono); font-size: 0.85em; background: var(--code-bg); border: 1px solid var(--line); border-radius: 4px; padding: 0.08em 0.35em; }
+pre { font-family: var(--mono); font-size: 0.82rem; line-height: 1.55; background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px; padding: 0.9rem 1.1rem; overflow-x: auto; margin: 0; }
+pre code { background: none; border: none; padding: 0; white-space: pre; }
+.codeblock { margin: 1.2rem 0; }
+.codeblock .chip { display: inline-block; font-family: var(--mono); font-size: 0.68rem; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; padding: 0.18rem 0.6rem; border-radius: 4px 4px 0 0; border: 1px solid var(--line); border-bottom: none; }
+.codeblock.sql .chip { color: var(--sql); background: var(--sql-soft); }
+.codeblock.pure .chip { color: var(--accent); background: var(--accent-soft); }
+.codeblock.sql pre { border-top-left-radius: 0; border-left: 3px solid var(--sql); }
+.codeblock.pure pre { border-top-left-radius: 0; border-left: 3px solid var(--accent); }
+.compare { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 1.2rem 0; }
+.compare .codeblock { margin: 0; }
+@media (max-width: 760px) { .compare { grid-template-columns: 1fr; } }
+table { border-collapse: collapse; width: 100%; font-size: 0.86rem; }
+.tablewrap { overflow-x: auto; margin: 1.2rem 0; }
+th { font-family: var(--mono); font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); text-align: left; padding: 0.5rem 0.9rem 0.5rem 0; border-bottom: 2px solid var(--line); white-space: nowrap; }
+td { padding: 0.55rem 0.9rem 0.55rem 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+td code { white-space: nowrap; }
+td .path { font-family: var(--mono); font-size: 0.78rem; word-break: break-all; }
+.pill { display: inline-block; font-family: var(--mono); font-size: 0.66rem; font-weight: 600; padding: 0.1rem 0.5rem; border-radius: 99px; white-space: nowrap; }
+.pill.p1 { color: var(--accent); background: color-mix(in srgb, var(--accent) 13%, transparent); }
+.pill.p2 { color: var(--sql); background: color-mix(in srgb, var(--sql) 14%, transparent); }
+.pill.new { color: var(--warn); background: color-mix(in srgb, var(--warn) 13%, transparent); }
+.pill.reuse { color: var(--good); background: color-mix(in srgb, var(--good) 12%, transparent); }
+.callout { background: var(--surface); border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 8px; padding: 1rem 1.3rem; margin: 1.5rem 0; font-size: 0.94rem; }
+.callout.warn { border-left-color: var(--warn); }
+.callout .callout-title { font-family: var(--mono); font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.1em; color: var(--accent); margin-bottom: 0.4rem; }
+.callout.warn .callout-title { color: var(--warn); }
+ul, ol { padding-left: 1.3rem; margin: 0 0 1rem; }
+li { margin-bottom: 0.45rem; }
+.toc { font-size: 0.9rem; columns: 2; column-gap: 2.5rem; margin: 1.5rem 0 0; padding: 0; list-style: none; }
+@media (max-width: 640px) { .toc { columns: 1; } }
+.toc li { break-inside: avoid; margin-bottom: 0.35rem; }
+.toc a { text-decoration: none; color: var(--ink); }
+.toc a:hover { color: var(--accent); }
+.toc .secno { font-family: var(--mono); color: var(--accent); font-size: 0.8em; margin-right: 0.5em; font-weight: 600; }
+.footnote { font-size: 0.84rem; color: var(--muted); border-top: 1px solid var(--line); margin-top: 4rem; padding-top: 1.2rem; }
+strong { font-weight: 600; }
+</style>
+
+<div class="page">
+<header class="doc-head">
+  <p class="eyebrow">legend-engine · implementation plan</p>
+  <h1>Window columns without the ceremony</h1>
+  <p class="lede">Extend #5091's group-scoped aggregate pattern to windows, so a window column is written the same way a <code>groupBy</code> column already is — <code>~run : f | $f->plus(~id)</code> — and add nullary sugar for the ranking and navigation functions. Removes <code>{p,w,r|...}</code> from the ~80% of window columns that never touch <code>p</code> or <code>w</code>, and gives <code>groupBy</code> and windowed <code>extend</code> one shared reducer vocabulary.</p>
+  <ul class="toc">
+    <li><a href="#s1"><span class="secno">1</span>The problem</a></li>
+    <li><a href="#s2"><span class="secno">2</span>Design</a></li>
+    <li><a href="#s3"><span class="secno">3</span>S1 — frame-scoped aggregates</a></li>
+    <li><a href="#s4"><span class="secno">4</span>S2 — nullary window functions</a></li>
+    <li><a href="#s5"><span class="secno">5</span>E3 — frame builders</a></li>
+    <li><a href="#s6"><span class="secno">6</span>PCT coverage</a></li>
+    <li><a href="#s7"><span class="secno">7</span>Sequencing and risks</a></li>
+  </ul>
+</header>
+
+<h2 id="s1"><span class="secno">1</span>The problem</h2>
+<div class="prose">
+<p>Every column added inside a windowed <code>extend</code> takes a three-parameter lambda — <code>{p,w,r|...}</code> — whether or not the computation needs a partition or a window spec. A grep of every non-<code>reduce</code> window lambda in the current PCT suite:</p>
+</div>
+<div class="tablewrap"><table>
+  <tr><th>Body pattern</th><th>Count</th><th>Uses</th></tr>
+  <tr><td><code>$r.i</code> / <code>$r.id</code> / <code>$r.name</code> / <code>$r.grp</code> / <code>$r.menu_cogs_usd</code></td><td>93</td><td><strong>only <code>r</code></strong> — <code>p</code> and <code>w</code> declared and ignored</td></tr>
+  <tr><td><code>$p->lead($r)...</code>, <code>$p->lag($r)...</code>, <code>$p->rowNumber($r)</code></td><td>10</td><td><code>p</code> and <code>r</code>; <code>w</code> ignored</td></tr>
+  <tr><td><code>$p->rank($w,$r)</code>, <code>denseRank</code>, <code>percentRank</code>, <code>cumulativeDistribution</code>, <code>first</code>, <code>last</code>, <code>nth</code></td><td>14</td><td>genuinely all three</td></tr>
+</table></div>
+<div class="prose">
+<p>The parameters are not arbitrary — the native signatures explain the split exactly:</p>
+</div>
+<div class="tablewrap"><table>
+  <tr><th>Function family</th><th>Signature</th><th>Needs <code>w</code>?</th><th>Why</th></tr>
+  <tr><td><code>lead</code>, <code>lag</code>, <code>offset</code>, <code>rowNumber</code>, <code>ntile</code></td><td><code>(Relation&lt;T&gt;, T[, n])</code></td><td>No</td><td>Index arithmetic on the already-sorted partition.</td></tr>
+  <tr><td><code>rank</code>, <code>denseRank</code>, <code>percentRank</code>, <code>cumulativeDistribution</code></td><td><code>(Relation&lt;T&gt;, _Window&lt;T&gt;, T)</code></td><td>Yes</td><td>Tie detection needs <code>w.sortInfo</code> to know which columns to re-compare.</td></tr>
+  <tr><td><code>first</code>, <code>last</code>, <code>nth</code></td><td><code>(Relation&lt;T&gt;, _Window&lt;T&gt;, T)</code></td><td>Yes</td><td>Frame-relative; needs <code>w.frame</code>'s boundary.</td></tr>
+</table></div>
+<div class="callout warn">
+  <div class="callout-title">This is a leak, not a design feature</div>
+  <code>p</code> (the pre-sorted, materialized partition) and <code>w</code> (the window spec) are artifacts of the evaluator's per-partition loop, not part of the declarative meaning of "sum this column over this window." SQL's <code>RANK() OVER w</code> never asks the caller for a partition or a row; TDS 1.0's <code>func(colName, aggregateFn)</code> builder already avoided this.
+</div>
+
+<h2 id="s2"><span class="secno">2</span>Design</h2>
+<div class="prose">
+<p>Two additive changes, neither requiring a parser change:</p>
+<ul>
+  <li><strong>S1 — frame-scoped aggregates.</strong> A new <code>extend</code> overload binds the lambda parameter to the <em>frame</em> as a <code>Relation</code>, exactly as #5091's <code>groupBy</code> overload binds the group. The reducer vocabulary is then shared between the two.</li>
+  <li><strong>S2 — nullary window functions.</strong> <code>rank()</code>, <code>lag(~col)</code>, <code>sum(~col)</code> become reserved forms the compiler lowers before any backend sees them.</li>
+</ul>
+</div>
+
+<div class="callout">
+  <div class="callout-title">The symmetry this rests on</div>
+  #5091 already ships <code>groupBy(r, cols, FuncColSpec&lt;{Relation&lt;T&gt;[1]->Any[0..1]}, R&gt;)</code> — one lambda over the whole group. S1 is the same spec type with a window in place of the grouping columns. Because the spec shape is identical, the reducers written for one work unchanged in the other: <code>joinStrings(rel, ~col, sep)</code> already exists and becomes available under a window for free.
+</div>
+
+<div class="callout">
+  <div class="callout-title">Pushdown contract</div>
+  Relational stores never execute these lambda bodies. Per #5091's doc comment on <code>reduce</code>: they "intercept <code>reduce</code> by function id, so every aggregate written on top of it is pushed down without needing its own processor." A body built from the reducer vocabulary pushes down; a body containing arbitrary code runs in-memory and must fail with a clear routing error on relational. This is the contract <code>groupBy</code>'s <code>g|...</code> form already ships with — inherited, not invented.
+</div>
+
+<div class="callout warn">
+  <div class="callout-title">The one hard correctness requirement</div>
+  The lambda parameter must be bound to the <strong>frame</strong>, not the partition. With <code>rows(unbounded(), 0)</code> the two differ on every row but the last, and binding the partition would turn a running total into a constant — while still looking like SQL's <code>SUM(x) OVER w</code>. The natives must reuse the frame-slicing already inside the 5-argument window <code>reduce</code> native rather than reimplementing it, and §6's equivalence tests are the gate.
+</div>
+
+<h2 id="s3"><span class="secno">3</span>S1 — frame-scoped aggregates</h2>
+<div class="prose">
+<p>Paths abbreviated: <code>core_functions_relation</code> = <span class="path">legend-engine-core/legend-engine-core-pure/legend-engine-pure-code-functions-relation/legend-engine-pure-functions-relation-pure/src/main/resources/core_functions_relation</span>; <code>core_relational</code> = <span class="path">legend-engine-xts-relationalStore/…/legend-engine-xt-relationalStore-core-pure/src/main/resources/core_relational/relational</span>.</p>
+</div>
+
+<div class="compare">
+  <div class="codeblock pure"><span class="chip">Pure · today</span><pre><code>$t->extend(over(~grp, ~o->ascending(), rows(unbounded(), 0)),
+           ~run : {p,w,r | $r.id} : y | $y->plus())</code></pre></div>
+  <div class="codeblock pure"><span class="chip">Pure · with S1</span><pre><code>$t->extend(over(~grp, ~o->ascending(), rows(unbounded(), 0)),
+           ~run : f | $f->plus(~id))</code></pre></div>
+</div>
+
+<h3>3.1 The overload</h3>
+<div class="codeblock pure"><span class="chip">Pure · new signatures, mirroring the groupBy pair</span><pre><code>native function extend&lt;T,R&gt;(r:Relation&lt;T&gt;[1], w:_Window&lt;T&gt;[1],
+    f:FuncColSpec&lt;{Relation&lt;T&gt;[1]->Any[0..1]}, R&gt;[1]):Relation&lt;T+R&gt;[1];
+
+native function extend&lt;T,R&gt;(r:Relation&lt;T&gt;[1], w:_Window&lt;T&gt;[1],
+    f:FuncColSpecArray&lt;{Relation&lt;T&gt;[1]->Any[*]}, R&gt;[1]):Relation&lt;T+R&gt;[1];</code></pre></div>
+<div class="prose">
+<p>Identical spec type to #5091's <code>groupBy</code> overloads, with <code>_Window&lt;T&gt;</code> replacing <code>ColSpec</code>/<code>ColSpecArray</code>. The single-parameter colspec lambda types correctly as of legend-pure ≥5.94.1 — the fix #5091 forced through for its own <code>g|...</code> form.</p>
+</div>
+
+<h3>3.2 The shared reducer vocabulary</h3>
+<div class="prose">
+<p>Each is a one-line Pure body over the existing 2-argument <code>reduce(rel, map, agg)</code>, following <code>aggregation/joinStrings.pure</code> exactly. They take a <code>Relation</code>, so they serve <strong>both</strong> <code>groupBy</code> and windowed <code>extend</code>:</p>
+</div>
+<div class="codeblock pure"><span class="chip">Pure · new reducers, no natives</span><pre><code>function plus&lt;T&gt;(rel:Relation&lt;T&gt;[1], col:ColSpec&lt;(?:Number)⊆T&gt;[1]):Number[1]
+{
+  $rel->reduce(x|eval($col,$x), y|$y->plus());
+}
+// max, min, average, stdDev, variance: same shape, different reduce lambda
+
+function count&lt;T&gt;(rel:Relation&lt;T&gt;[1]):Integer[1]
+{
+  $rel->reduce(x|1, y|$y->plus());   // COUNT(*) — no column to map from
+}
+
+// joinStrings(rel, ~col, sep) already exists from #5091 — now works under a window too</code></pre></div>
+
+<h3>3.3 Edit plan</h3>
+<div class="tablewrap"><table>
+  <tr><th>File</th><th></th><th>Edit</th></tr>
+  <tr><td class="path">core_functions_relation/…/transformation/extend.pure</td><td><span class="pill new">new</span></td><td>The 2 overloads from §3.1, with PCT tests.</td></tr>
+  <tr><td class="path">core_functions_relation/…/aggregation/{plus,max,min,average,count,stdDev,variance}.pure</td><td><span class="pill new">new</span></td><td>The §3.2 one-liners. Pure-bodied; no natives, no per-store work.</td></tr>
+  <tr><td class="path">legend-engine-core/…/handlers/Handlers.java</td><td><span class="pill new">new</span></td><td>Inference for the 2 overloads, modeled on the entries #5091 added for the <code>groupBy</code> <code>FuncColSpec</code> forms — same spec type, so the same shape of type resolution.</td></tr>
+  <tr><td class="path">…/resources/handlers_dispatch_functions.txt</td><td><span class="pill new">new</span></td><td>2 function ids.</td></tr>
+  <tr><td class="path">Interpreted + compiled natives (relation extension)</td><td><span class="pill new">new</span></td><td>Per row: slice the frame, pass it as a <code>Relation</code>, eval the lambda. <strong>Reuse the frame-slicing inside the existing 5-argument window <code>reduce</code> native</strong> — factor it out rather than reimplementing (see §2's correctness requirement). Compiled side follows <code>GroupByFuncSupport.java</code>'s shared-codegen structure.</td></tr>
+  <tr><td class="path">core_relational/pureToSQLQuery/pureToSQLQuery.pure</td><td><span class="pill reuse">small</span></td><td>Dispatch entries for the 2 overloads, processing the lambda body with <code>state.currentWindow</code> set. Everything downstream already exists: the body's <code>reduce(rel,map,agg)</code> call is dispatch-registered to <code>processRelationReduce</code> (line 10870), and <code>processAggFn</code> (line ~6590) already wraps an aggregate DynaFunction in <code>state.currentWindow</code> when one is set — so <code>SUM(id) OVER (...)</code> falls out with no new SQL-generation logic. Add the clear routing error for non-interceptable bodies (§2's pushdown contract).</td></tr>
+  <tr><td class="path">…/compiler/test/TestRelationFunctions.java</td><td><span class="pill new">new</span></td><td>Compile tests for the new call shapes; confirm 3-parameter lambdas still resolve to the existing overloads.</td></tr>
+</table></div>
+
+<h2 id="s4"><span class="secno">4</span>S2 — nullary window functions</h2>
+<div class="prose">
+<p>S1 removes <code>p</code> and <code>w</code> but keeps a lambda. S2 removes the lambda for the closed set of functions SQL itself writes bare after <code>OVER</code>:</p>
+</div>
+
+<div class="compare">
+  <div class="codeblock pure"><span class="chip">Pure · with S1 only</span><pre><code>$t->extend(over(~grp, ~o->ascending()), ~[
+  rk      : {p,w,r| $p->rank($w, $r)},
+  prevQty : {p,w,r| $p->lag($r).qty},
+  total   : f | $f->plus(~qty)])</code></pre></div>
+  <div class="codeblock pure"><span class="chip">Pure · with S2</span><pre><code>$t->extend(over(~grp, ~o->ascending()), ~[
+  rk      : rank(),
+  prevQty : lag(~qty),
+  total   : sum(~qty)])</code></pre></div>
+</div>
+
+<h3>4.1 Mechanism</h3>
+<div class="prose">
+<p>A compile-time lowering, not a reimplementation. The same normalization stage that already handles <code>functionType.NormalizeRequiredFunction</code> for <code>ascending</code>/<code>over</code>/<code>rows</code>/<code>_range</code> recognizes a bare call to one of the reserved names in a windowed <code>extend</code> ColSpec and rewrites it before the graph reaches any backend:</p>
+</div>
+<div class="codeblock pure"><span class="chip">Pure · lowering</span><pre><code>~rk : rank()          ⟶  ~rk : {p,w,r| $p->rank($w, $r)}     // existing 3-param native
+~prevQty : lag(~qty)  ⟶  ~prevQty : {p,w,r| $p->lag($r).qty} // existing 3-param native
+~total : sum(~qty)    ⟶  ~total : f | $f->plus(~qty)          // S1 form + §3.2 reducer</code></pre></div>
+<div class="prose">
+<p>Both lowering targets are code that already ships once S1 lands. No interpreted native, compiled codegen path, or SQL generator observes the difference between sugared and unsugared spellings. The <code>{p,w,r|...}</code> form remains available as the escape hatch for genuinely custom per-row computations.</p>
+<p><code>sum</code>/<code>avg</code>/<code>min</code>/<code>max</code> are exposed as SQL-familiar aliases over §3.2's reducers (whose Pure-level names — <code>plus</code>, <code>average</code> — follow the platform's existing collection vocabulary).</p>
+</div>
+
+<h3>4.2 Edit plan</h3>
+<div class="tablewrap"><table>
+  <tr><th>File</th><th></th><th>Edit</th></tr>
+  <tr><td class="path">core_functions_relation/…/ranking/*.pure, slice/{lag,lead,first,last,nth}.pure</td><td><span class="pill new">new</span></td><td>Nullary/column-only signatures alongside the existing natives, marked <code>&lt;&lt;functionType.NormalizeRequiredFunction&gt;&gt;</code>, with <code>doc.doc</code> stating they are legal only inside a windowed <code>extend</code>. No bodies — the lowering intercepts them first.</td></tr>
+  <tr><td class="path">core/pure/router/routing/router_routing.pure</td><td><span class="pill reuse">small</span></td><td>One new normalization branch performing the §4.1 rewrite. Same mechanism as the existing entries, not a new one.</td></tr>
+  <tr><td class="path">legend-engine-core/…/handlers/Handlers.java</td><td><span class="pill new">new</span></td><td>Register the reserved names; raise a clear <code>EngineException</code> (COMPILATION) when one is used outside a windowed <code>extend</code>, mirroring SQL's own restriction.</td></tr>
+  <tr><td class="path">…/resources/handlers_dispatch_functions.txt</td><td><span class="pill new">new</span></td><td>The new function ids.</td></tr>
+  <tr><td class="path">…/compiler/test/TestRelationFunctions.java</td><td><span class="pill new">new</span></td><td>Lowering tests per function, plus the negative case.</td></tr>
+</table></div>
+<div class="prose">
+<p>S2 adds no Java execution logic, no SQL-generator changes, and no PCT manifest entries — a store excluded from <code>rank</code> today stays excluded from <code>rank()</code> automatically, since the lowering produces the call the existing exclusion already matches.</p>
+</div>
+
+<h2 id="s5"><span class="secno">5</span>E3 — frame builders</h2>
+<div class="prose">
+<p>Independent and cheap. <code>rows</code>/<code>_range</code> are already <code>&lt;&lt;NormalizeRequiredFunction&gt;&gt;</code> library sugar over the <code>Rows</code>/<code>_Range</code> classes, so this is new names only:</p>
+</div>
+<div class="codeblock pure"><span class="chip">Pure · library sugar, no natives</span><pre><code>rowsBetween(unboundedPreceding(), currentRow())   // vs. rows(unbounded(), 0)
+rangeBetween(preceding(1), following(1))          // vs. _range(-1, 1)</code></pre></div>
+<div class="prose"><p>Retires the <code>_range</code> spelling and the bare-<code>0</code>/negative-integer convention from user-facing code.</p></div>
+
+<h2 id="s6"><span class="secno">6</span>PCT coverage</h2>
+<div class="prose">
+<ul>
+  <li><strong>Frame-scope equivalence (the §2 gate):</strong> each reducer written both ways — frame-scoped and 3-parameter map/reduce — asserted identical, across <code>rows(unbounded(), 0)</code>, explicit bounded frames, and the no-explicit-frame default. A test that would pass if the lambda were bound to the partition instead of the frame is not sufficient; running totals must be asserted row by row.</li>
+  <li><strong>Shared-vocabulary tests:</strong> each §3.2 reducer used under <code>groupBy</code> and under a window in the same suite, confirming one implementation serves both.</li>
+  <li><strong>S2 lowering:</strong> sugared vs. unsugared spelling per reserved function; a composition test mixing sugared ranking, sugared aggregates, and hand-written <code>{p,w,r|...}</code> in one <code>extend</code>.</li>
+  <li><strong>Negative:</strong> <code>rank()</code> outside a windowed <code>extend</code>; a non-interceptable lambda body failing with the §2 routing error on relational while succeeding in-memory.</li>
+</ul>
+</div>
+
+<h2 id="s7"><span class="secno">7</span>Sequencing and risks</h2>
+<div class="tablewrap"><table>
+  <tr><th>PR</th><th>Scope</th><th>Gate</th></tr>
+  <tr><td><span class="pill p1">PR 1</span></td><td>S1 §3 — overloads, shared reducers, natives, relational dispatch</td><td>Frame-scope equivalence PCT green on H2/DuckDB/Java binding; cloud stores via <code>pct-cloud-test</code></td></tr>
+  <tr><td><span class="pill p1">PR 2</span></td><td>S2 §4 — reserved signatures, lowering, negative compile tests</td><td>Lowering-equivalence PCT on the default profile; no new exclusions expected</td></tr>
+  <tr><td><span class="pill p2">PR 3</span></td><td>E3 §5 — frame builders; no dependency on PR 1/2, can ship first</td><td>Library-only PCT</td></tr>
+</table></div>
+<div class="prose">
+<ul>
+  <li><strong>Frame vs. partition binding</strong> — the §2 correctness requirement. Mitigated by factoring the existing window <code>reduce</code> native's slicing rather than writing new slicing, and gated by §6's equivalence tests.</li>
+  <li><strong>In-memory cost</strong> — materializing a frame per row is O(rows × frame size). That is already the cost profile of the existing window <code>reduce</code> path, so no regression, but worth confirming no accidental re-slicing per reducer when a <code>FuncColSpecArray</code> carries several columns over one window.</li>
+  <li><strong>Non-interceptable bodies</strong> — must fail with a clear routing error on relational, not silently produce wrong SQL. Same contract as <code>groupBy</code>'s <code>g|...</code> today; the error message should name the interceptable vocabulary.</li>
+  <li><strong>No protocol impact</strong> — function additions plus a compiler-internal rewrite; nothing is serialized as a protocol class, so Studio/DataCube and versioned protocol packages are untouched.</li>
+</ul>
+</div>
+
+<p class="footnote">Grounded in legend-engine master @ 0d30a052fde. Reused as-is: <code>reduce(rel,map,agg)</code> (aggregation/reduce.pure; dispatch-registered pureToSQLQuery.pure:10870 → <code>processRelationReduce</code>), <code>joinStrings(rel,~col,sep)</code> (aggregation/joinStrings.pure), the 5-argument window <code>reduce</code> native (:10901 → <code>processReduceWindow</code>, :4747), <code>state.currentWindow</code> (State:122, set at :3899–3901, consumed by <code>processAggFn</code> :6590), <code>groupBy</code>'s <code>FuncColSpec</code> overloads and <code>GroupByFuncSupport.java</code> (#5091), and the ranking/navigation natives (Rank, DenseRank, PercentRank, RowNumber, NTile, First, Last, Nth, Offset — untouched).</p>
+</div>
+
+</body></html>
